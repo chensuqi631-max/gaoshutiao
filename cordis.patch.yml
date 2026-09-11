@@ -1,0 +1,5 @@
+# dsh bundle patch: 把本插件插入 profile 的加载层 (装完自动挂载, 客户不需要手改任何配置)
+# 注意: name 必须是"可解析到的包名" —— 用 npm 装时就是包名; 用 tgz/本地路径装时, DSH 按包名解析
+- insert:
+    - id: zying-collect
+      name: 'zying-erp'

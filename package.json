@@ -1,0 +1,43 @@
+{
+  "name": "zying-erp",
+  "version": "1.1.1",
+  "description": "智赢ERP 搞薯条：亚马逊选品/跟卖分析（采集 · 商品库 · 统一筛选 · FBA/FBM/自营利润测算 · 找货源以图搜图 · 导出Excel）— DeepSeek Harness 插件",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "amazon",
+    "选品",
+    "跟卖",
+    "erp",
+    "profit-calculator",
+    "product-research"
+  ],
+  "author": "智赢ERP <2457136010@qq.com>",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "erp",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

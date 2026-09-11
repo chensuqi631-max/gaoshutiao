@@ -1,0 +1,5 @@
+{
+  "enforce": true,
+  "contact": "QQ 2457136010",
+  "_说明": "没有有效 license.key 的机器, 所有 /api 请求都会被 403"
+}

@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>跨境电商采集管理 · Demo</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div id="app">
+  <!-- 侧边栏 -->
+  <aside id="sidebar">
+    <div class="logo">
+      <span class="logo-icon" id="logoIcon"></span>
+      <div>
+        <div class="logo-sub" style="font-size:13px;font-weight:700">跨境电商采集管理</div>
+        <div class="logo-sub">DEMO v2.1</div>
+      </div>
+    </div>
+    <nav id="nav">
+      <button class="nav-item active" data-page="workbench" data-icon="workbench" data-desc="对话式操作系统: 通过对话调取数据、找商品、执行任务">
+        <span class="nav-emoji"></span> 工作台
+      </button>
+      <button class="nav-item" data-page="collect" data-icon="collect" data-desc="商品采集: 6 种采集方式小模块 + 采集过滤(可保存规则), 全程CDP">
+        <span class="nav-emoji"></span> 商品采集
+      </button>
+      <button class="nav-item" data-page="product" data-icon="product" data-desc="商品管理: 采集到的商品数据列表/筛选/详情/批量操作">
+        <span class="nav-emoji"></span> 商品管理
+      </button>
+      <button class="nav-item" data-page="compliance" data-icon="compliance" data-desc="RAG 合规检测: 品牌库/专利库/规则库检索, 品牌监控与风险预警">
+        <span class="nav-emoji"></span> 合规检测
+      </button>
+      <button class="nav-item" data-page="claims" data-icon="claims" data-desc="批量认领与刊登: 草稿箱编辑, 多店铺批量发布, 失败重发">
+        <span class="nav-emoji"></span> 批量刊登
+      </button>
+      <button class="nav-item" data-page="reprice" data-icon="reprice" data-desc="智能调价: 15分钟自动跟价抢购物车, 保底价+差额, 策略自优化">
+        <span class="nav-emoji"></span> 智能调价
+      </button>
+      <button class="nav-item" data-page="flywheel" data-icon="flywheel" data-desc="数据飞轮: 合规/定价/选品/话术四轮驱动, 系统越用越聪明">
+        <span class="nav-emoji"></span> 数据飞轮
+      </button>
+      <button class="nav-item" data-page="agent" data-icon="agent" data-desc="AI Agent 助手: 选品评估/合规审查/调价策略, 人工采纳或拒绝">
+        <span class="nav-emoji"></span> AI Agent
+      </button>
+      <button class="nav-item" data-page="knowledge" data-icon="knowledge" data-desc="知识库与规则库: 品牌库/合规规则/定价策略/话术库统一管理">
+        <span class="nav-emoji"></span> 知识库
+      </button>
+      <button class="nav-item" data-page="logistics" data-icon="logistics" data-desc="物流工具: 云途/多家渠道运费试算比价, 物流配置, 集货发货">
+        <span class="nav-emoji"></span> 物流工具
+      </button>
+      <button class="nav-item" data-page="notify" data-icon="notify" data-desc="飞书/企微集成: 异常通知, 日报推送, 远程指令">
+        <span class="nav-emoji"></span> 消息通知
+      </button>
+    </nav>
+    <div class="sidebar-footer">
+      <button id="themeToggle" class="theme-toggle" title="切换主题">
+        <span id="themeIcon">🌙</span> <span id="themeLabel">暗色</span>
+      </button>
+      <div class="version">PRD V2.1 · MVP Demo</div>
+    </div>
+  </aside>
+
+  <!-- 主区域 -->
+  <main id="main">
+    <header id="topbar">
+      <div id="pageTitle">🛠️ 工作台</div>
+      <div id="pageDesc" class="page-desc">功能卡片工作台, 支持拖拽排序, 悬停查看功能说明</div>
+      <div class="topbar-right">
+        <span id="healthBadge" class="health-badge">● 服务在线</span>
+      </div>
+    </header>
+    <section id="content"></section>
+  </main>
+</div>
+
+<!-- 悬浮提示气泡 (卡片悬停/拖拽描述) -->
+<div id="tooltip" class="tooltip hidden"></div>
+
+<script src="/assets/app.js"></script>
+</body>
+</html>
