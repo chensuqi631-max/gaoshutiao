@@ -61,20 +61,151 @@ function showModal({ title = '提示', body = '', buttons = [{ label: '确定', 
   return id;
 }
 // 大图灯箱: 点击主图放大查看
+/** 商品列表状态记忆（页码 / 每页条数）—— 刷新页面、切走再回来都停在当前页 */
+const PM_LIST_KEY = 'zying.products.list.v1';
+function readPmList() {
+  try { return JSON.parse(window.localStorage.getItem(PM_LIST_KEY) || '{}') || {} } catch (e) { return {} }
+}
+function writePmList(patch) {
+  try {
+    const s = readPmList();
+    Object.keys(patch || {}).forEach((k) => { s[k] = patch[k]; });
+    window.localStorage.setItem(PM_LIST_KEY, JSON.stringify(s));
+  } catch (e) { /* 隐私模式/策略禁用 → 不记忆, 不影响列表 */ }
+}
+
+/**
+ * 亚马逊主图取高清版: 缩略图 URL 里的尺寸修饰符(`._AC_UY218_.jpg`)换成 `._AC_SL1500_.jpg`。
+ * 悬停预览 / 放大镜都必须用它 —— 直接放大 218px 缩略图只会得到一张糊图。
+ * 非亚马逊图床原样返回(没有这套修饰符, 硬加会 404)。
+ */
+function hiResImg(url, px) {
+  const u = String(url == null ? '' : url).trim();
+  if (!u || !/amazon\.com\/images\//i.test(u)) return u;
+  const size = px || 1500;
+  if (/\._[^./]*_\.(jpg|jpeg|png|webp|gif)$/i.test(u)) return u.replace(/\._[^./]*_\.(jpg|jpeg|png|webp|gif)$/i, '._AC_SL' + size + '_.$1');
+  if (/\.(jpg|jpeg|png|webp|gif)$/i.test(u)) return u.replace(/\.(jpg|jpeg|png|webp|gif)$/i, '._AC_SL' + size + '_.$1');
+  return u;
+}
+
+/** 主图放大镜灯箱: 高清原图 + 圆形镜片跟随放大 + 滚轮/按钮换倍率 */
 function openImageLightbox(src, title = '') {
+  const big = hiResImg(src, 1500);
   const mask = document.createElement('div');
   mask.className = 'modal-mask img-lightbox';
   mask.innerHTML = `
-    <div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:99999;background:rgba(0,0,0,.82);cursor:zoom-out" data-act="close">
-      <div style="max-width:92vw;max-height:88vh;text-align:center">
-        <img src="${esc(src)}" alt="${esc(title)}" style="max-width:92vw;max-height:82vh;border-radius:8px;object-fit:contain;box-shadow:0 8px 40px rgba(0,0,0,.5)">
-        <div style="color:#ccc;font-size:12px;margin-top:8px">${esc(title || '')} · 点击任意处关闭</div>
+    <div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:99999;background:rgba(0,0,0,.86)" data-act="bg">
+      <div style="background:#1b1b1f;border:1px solid #3a3a44;border-radius:12px;padding:12px;max-width:94vw">
+        <div style="color:#e8e8ee;font-size:13px;font-weight:600;margin-bottom:8px;display:flex;gap:10px;align-items:center">
+          <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">🔍 ${esc(title || '主图')}</span>
+          <span data-act="zoom" style="display:flex;gap:4px"></span>
+          <button data-act="close" style="background:none;border:1px solid #3a3a44;color:#aaa;border-radius:6px;cursor:pointer;padding:2px 8px">✕</button>
+        </div>
+        <div style="position:relative;width:min(760px,90vw);height:min(560px,72vh);background:#fff;border-radius:8px;overflow:hidden;cursor:crosshair" data-act="stage">
+          <img src="${esc(big)}" alt="${esc(title)}" style="width:100%;height:100%;object-fit:contain" draggable="false">
+          <div data-act="box" style="position:absolute;border:1px solid rgba(120,170,255,.9);background:rgba(120,170,255,.12);border-radius:4px;pointer-events:none;display:none"></div>
+          <div data-act="lens" style="position:absolute;width:190px;height:190px;border-radius:50%;border:2px solid #4f8cff;box-shadow:0 6px 20px rgba(0,0,0,.6);background-repeat:no-repeat;pointer-events:none;display:none"></div>
+        </div>
+        <div style="color:#8b93a3;font-size:12px;margin-top:8px">鼠标移到图上 → 镜片跟随放大 · 滚轮 / 点上方倍率换档 · 点背景或 ✕ 关闭 · 用 1500px 原图</div>
       </div>
     </div>`;
   document.body.appendChild(mask);
-  mask.addEventListener('click', () => mask.remove());
-  document.addEventListener('keydown', function escKey(e) { if (e.key === 'Escape') { mask.remove(); document.removeEventListener('keydown', escKey); } });
+  const stage = mask.querySelector('[data-act="stage"]');
+  const box = mask.querySelector('[data-act="box"]');
+  const lens = mask.querySelector('[data-act="lens"]');
+  const zWrap = mask.querySelector('[data-act="zoom"]');
+  let z = 2.5;
+  const paintZoom = () => {
+    zWrap.innerHTML = [1.5, 2, 2.5, 3, 4, 6].map((v) => `<button data-z="${v}" style="background:${v === z ? '#2f6feb' : 'none'};border:1px solid ${v === z ? '#2f6feb' : '#3a3a44'};color:${v === z ? '#fff' : '#aaa'};border-radius:6px;cursor:pointer;padding:2px 7px">${v}x</button>`).join('');
+    zWrap.querySelectorAll('[data-z]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); z = Number(b.dataset.z); paintZoom(); move(lastEv); }));
+  };
+  let lastEv = null;
+  const move = (e) => {
+    if (!e) return;
+    lastEv = e;
+    const r = stage.getBoundingClientRect();
+    const x = Math.min(100, Math.max(0, ((e.clientX - r.left) / r.width) * 100));
+    const y = Math.min(100, Math.max(0, ((e.clientY - r.top) / r.height) * 100));
+    const w = 100 / z;
+    box.style.display = 'block'; lens.style.display = 'block';
+    box.style.width = w + '%'; box.style.height = w + '%';
+    box.style.left = 'calc(' + x + '% - ' + w / 2 + '%)'; box.style.top = 'calc(' + y + '% - ' + w / 2 + '%)';
+    lens.style.left = 'calc(' + x + '% - 95px)'; lens.style.top = 'calc(' + y + '% - 95px)';
+    lens.style.backgroundImage = 'url(' + big + ')';
+    lens.style.backgroundSize = (z * 100) + '% auto';
+    lens.style.backgroundPosition = x + '% ' + y + '%';
+  };
+  stage.addEventListener('mousemove', move);
+  stage.addEventListener('mouseleave', () => { box.style.display = 'none'; lens.style.display = 'none'; });
+  stage.addEventListener('wheel', (e) => { e.preventDefault(); z = Math.min(6, Math.max(1.5, Math.round((z + (e.deltaY < 0 ? 0.5 : -0.5)) * 2) / 2)); paintZoom(); move(e); }, { passive: false });
+  const close = () => { mask.remove(); document.removeEventListener('keydown', escKey); };
+  const escKey = (e) => { if (e.key === 'Escape') close(); };
+  mask.addEventListener('click', (e) => { if (e.target.dataset.act === 'bg' || e.target.dataset.act === 'close') close(); });
+  document.addEventListener('keydown', escKey);
+  paintZoom();
 }
+
+/** 站点 → amazon 域名(与后端 siteToHostSuffix 同表) */
+function amzHostOf(site) {
+  return 'www.amazon.' + ({ uk: 'co.uk', us: 'com', jp: 'co.jp', au: 'com.au', mx: 'com.mx', br: 'com.br', sg: 'com.sg', tr: 'com.tr', ae: 'ae', sa: 'sa', nl: 'nl', se: 'se', pl: 'pl', de: 'de', fr: 'fr', it: 'it', es: 'es', ca: 'ca', in: 'in' }[site] || site || 'de');
+}
+/**
+ * 一个商品身上所有可打开的链接(去重)。
+ * 覆盖: 商品页 / 品牌页 / 品牌店 / 卖家页 / 卖家店铺 / 1688 同款 ——
+ * 不同采集方式写入的字段名不完全一致(brandLink·brandUrl、sellerLink·sellerUrl、is1688Url), 都兜一遍。
+ */
+function productLinksOf(p) {
+  const out = [], seen = {};
+  const add = (label, url) => {
+    const u = String(url == null ? '' : url).trim();
+    if (!u || !/^https?:/i.test(u) || seen[u]) return;
+    seen[u] = 1;
+    out.push({ label, url: u });
+  };
+  add('商品页', 'https://' + amzHostOf(p.site) + '/dp/' + p.asin);
+  add('品牌页', p.brandLink || p.brandUrl);
+  add('卖家页', p.sellerLink || p.sellerUrl || (p.sellerId ? 'https://' + amzHostOf(p.site) + '/sp?seller=' + p.sellerId : ''));
+  add('1688 同款', p.is1688Url);
+  return out;
+}
+/**
+ * 打开一批商品的所有链接(逐个交给系统默认浏览器; 用 /api/open 而不是 window.open,
+ * 因为连续 window.open 会被浏览器当弹窗拦截)。
+ */
+async function openProductsLinks(products) {
+  const all = [];
+  const seen = {};                          // ★ 跨商品全局去重: 多个商品共用同一品牌页/卖家页时只开一次
+  products.forEach((p) => productLinksOf(p).forEach((l) => {
+    if (seen[l.url]) return;
+    seen[l.url] = 1;
+    all.push(Object.assign({ asin: p.asin }, l));
+  }));
+  if (!all.length) { await zyAlert('没有可打开的链接', '所选商品没有商品页/品牌页/卖家页/1688 链接'); return 0 }
+  const LIMIT = 60;                       // 防手滑: 50 商品 × 4 链接 = 200 标签页会把浏览器打死
+  const willOpen = all.slice(0, LIMIT);
+  const byKind = {};
+  all.forEach((l) => { byKind[l.label] = (byKind[l.label] || 0) + 1; });
+  const kinds = Object.keys(byKind).map((k) => k + ' ' + byKind[k]).join(' · ');
+  const okGo = await zyConfirm('🔗 打开所选商品的所有链接',
+    `将打开 <b>${willOpen.length}</b> 个链接（${products.length} 个商品：${kinds}）`
+    + (all.length > LIMIT ? `<br><span style="color:#b00020">另有 ${all.length - LIMIT} 个超出上限(${LIMIT})未打开</span>` : '')
+    + '<br>系统默认浏览器会逐个新开标签页。');
+  if (!okGo) return 0;
+  let opened = 0;
+  for (const l of willOpen) {
+    try {
+      await API('/api/open?url=' + encodeURIComponent(l.url));
+      opened++;
+    } catch (e) { /* 单个失败不影响其余 */ }
+    await new Promise((r) => setTimeout(r, 220));   // 稍微错开, 别让浏览器把连续弹窗当垃圾
+  }
+  await zyAlert('✔ 已打开链接', `共打开 <b>${opened}</b> 个链接`
+    + (all.length > LIMIT ? `<br><span class="muted">超出上限的 ${all.length - LIMIT} 个未打开</span>` : ''));
+  return opened;
+}
+
+/* 主图悬停预览已按需求删除(2026-09): 悬停弹出浮层容易误挡视线, 商品图现在只保留
+   「点击 → 放大镜灯箱」这一种交互。原 bindMainImageHover() 整段移除。 */
 
 // 消息框 (替代 alert)
 function zyAlert(title, message = '') {
@@ -213,8 +344,10 @@ const PAGES = {
   flywheel: { title: '数据飞轮', desc: '合规/定价/选品/话术四轮驱动, 系统越用越聪明', icon: 'flywheel' },
   agent: { title: 'AI Agent', desc: '选品评估/合规审查/调价策略, 人工采纳或拒绝', icon: 'agent' },
   knowledge: { title: '知识库', desc: '品牌库/合规规则/定价策略/话术库统一管理', icon: 'knowledge' },
-  logistics: { title: '物流工具', desc: '运费试算比价 (云途官网 CDP 免费试算), 物流配置, 集货发货', icon: 'logistics' },
+  logistics: { title: '物流工具', desc: '报价表维护与试算 (首重/续重), 集货发货', icon: 'logistics' },
   notify: { title: '消息通知', desc: '飞书/企微集成: 异常通知, 日报推送, 远程指令', icon: 'notify' },
+  listing: { title: '上架记录', desc: '插件从 Amazon 详情页采集的上架清单 (与商品管理库物理隔离); 上品工具 ifast.top 可直接读取', icon: 'claims' },
+  archive: { title: '选品归档', desc: '把最终选出来的品连同当时的承受价/利润率存成快照: 可检索 / 可去重 / 可导出文件', icon: 'file' },
 };
 
 function navigate(page) {
@@ -222,7 +355,7 @@ function navigate(page) {
   const meta = PAGES[page];
   $('#pageTitle').innerHTML = (meta.icon ? ic(meta.icon, 17) + ' ' : '') + meta.title;
   $('#pageDesc').textContent = meta.desc;
-  const render = { workbench: renderWorkbench, collect: renderCollect, product: renderProduct, compliance: renderCompliance, claims: renderClaims, reprice: renderReprice, flywheel: renderFlywheel, agent: renderAgent, knowledge: renderKnowledge, logistics: renderLogistics, notify: renderNotify }[page];
+  const render = { workbench: renderWorkbench, collect: renderCollect, product: renderProduct, compliance: renderCompliance, claims: renderClaims, reprice: renderReprice, flywheel: renderFlywheel, agent: renderAgent, knowledge: renderKnowledge, logistics: renderLogistics, notify: renderNotify, listing: renderListing, archive: renderArchive }[page];
   render();
 }
 
@@ -929,7 +1062,8 @@ const coPayload = (f) => ({
   filterRatingRange: f.filterRatingRange || '',
   filterReviewsRange: f.filterReviewsRange || '',
   filterQ: f.filterQ,
-  filterBadges: Array.isArray(f.filterBadges) ? f.filterBadges : [],
+  filterBadgesNot: Array.isArray(f.filterBadgesNot) ? f.filterBadgesNot : [],   // ★ 页面标识改为【排除法】(旧 filterBadges 含任一仍由服务端兼容)
+  filterHasRankOnly: f.filterHasRankOnly || '',                                 // ★ 只看有排名 (排除没有排名的商品)
   filterTmRange: f.filterTmRange || '',
   filterTmCountries: f.filterTmCountries,
   filterCategory: f.filterCategory,
@@ -949,11 +1083,12 @@ const coDesc = (f) => {
     f.filterShopAplus === '1' ? '仅A+店铺' : (f.filterShopAplus === '0' ? '排除A+店铺' : ''),
     f.filterBrandShop === '0' ? '排除品牌店铺' : (f.filterBrandShop === '1' ? '仅品牌店铺' : ''),
     (f.filterBrandStore || '').startsWith('!') ? '排除品牌店链接' : (f.filterBrandStore ? `品牌店=${f.filterBrandStore}` : ''),
-    fmtRange(r1.min, r1.max) ? `BSR:${fmtRange(r1.min, r1.max)}` : '',
+    fmtRange(r1.min, r1.max) ? `大排名:${fmtRange(r1.min, r1.max)}` : '',
+    f.filterHasRankOnly === '1' ? '仅看有排名(排除没有排名)' : '',
     fmtRange(r2.min, r2.max) ? `价:${fmtRange(r2.min, r2.max)}` : '',
     fmtRange(r3.min, r3.max) ? `评分:${fmtRange(r3.min, r3.max)}` : '',
     fmtRange(r4.min, r4.max) ? `评论:${fmtRange(r4.min, r4.max)}` : '',
-    (Array.isArray(f.filterBadges) && f.filterBadges.length) ? `标识:${f.filterBadges.map((b) => BADGE_LABELS[b] || b).join(',')}` : '',
+    (Array.isArray(f.filterBadgesNot) && f.filterBadgesNot.length) ? `排除标识:${f.filterBadgesNot.map((b) => BADGE_LABELS[b] || b).join(',')}` : '',
     f.filterQ ? `标题含「${f.filterQ}」` : '',
     fmtRange(r6.min, r6.max) ? `排除商标:${fmtRange(r6.min, r6.max)}` : '',
     f.filterTmCountries ? `排除商标国家:${f.filterTmCountries}` : '',
@@ -983,7 +1118,8 @@ const cfValues = () => ({
   filterRatingRange: $('#cfRatingRange') ? $('#cfRatingRange').value : '',
   filterReviewsRange: $('#cfReviewsRange') ? $('#cfReviewsRange').value : '',
   filterQ: $('#cfQ') ? $('#cfQ').value : '',
-  filterBadges: String($('#cfBadges') ? $('#cfBadges').value : '').split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+  filterBadgesNot: String($('#cfBadgesNot') ? $('#cfBadgesNot').value : '').split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+  filterHasRankOnly: ($('#cfHasRankOnly') && $('#cfHasRankOnly').checked) ? '1' : '',
   filterTmRange: $('#cfTmRange') ? $('#cfTmRange').value : '',
   filterTmCountries: $('#cfTmCountries') ? $('#cfTmCountries').value : '',
   filterSalesRange: $('#cfSalesRange') ? $('#cfSalesRange').value : '',
@@ -1215,10 +1351,10 @@ async function renderProduct() {
       <input id="cSearch" class="input" placeholder="🔍 搜索 ASIN / 标题" style="width:200px;flex-shrink:0">
       <select id="cFba" class="select" style="flex-shrink:0"><option value="">全部配送</option><option value="FBA">FBA</option><option value="FBM">FBM</option></select>
       <select id="cSell" class="select" style="flex-shrink:0"><option value="">全部卖家</option><option value="amz">AMZ 自营</option><option value="third">第三方卖家</option></select>
-      <select id="cAplus" class="select" style="flex-shrink:0"><option value="">全部 A+</option><option value="1">仅有 A+</option><option value="0">排除 A+</option></select>
       <select id="cBadge" class="select" style="flex-shrink:0"><option value="">全部标签</option><option value="bestseller">Best Seller</option><option value="choice">⭐ A (Amazon's Choice)</option><option value="deal">限时优惠</option><option value="newrelease">新品</option></select>
       <button id="cFilter" class="btn" style="flex-shrink:0">自定义筛选</button>
-      <button id="cRefreshRank" class="btn" style="flex-shrink:0" title="对无排名商品批量补采 BSR (读详情页, 可中途停止)">补采排名</button>
+      <button id="cRefreshRank" class="btn" style="flex-shrink:0" title="对无大排名商品批量补采大排名 (读详情页+插件面板, 可中途停止)">补采排名</button>
+      <button id="cBackfill" class="btn primary" style="flex-shrink:0" title="只对【勾选】的商品补采: 详情页字段 + 插件面板(商标/月销), 可选 aod 跟卖。未勾选时会提示。">一键补采</button>
       <button id="c1688Search" class="btn" style="flex-shrink:0" title="对选中商品批量上传主图到 1688 以图搜图, 找同款货源并存入">1688 图搜找货</button>
       <span class="muted" id="cCount" style="flex-shrink:0"></span>
     </div>
@@ -1228,9 +1364,10 @@ async function renderProduct() {
       <div class="filter-grid">
         <div class="filter-item"><label>价格 (€, 格式 最小-最大)</label><input id="fPriceRange" class="input" placeholder="如 100-200"></div>
         <div class="filter-item"><label>月销量 (格式 最小-最大)</label><input id="fSalesRange" class="input" placeholder="如 1000-5000"></div>
-        <div class="filter-item"><label>排名 ≤ (BSR, 空=不限)</label><input id="fRankMax" class="input" type="number" min="0" placeholder="如 500000"></div>
+        <div class="filter-item"><label>大排名 ≤ (空=不限)</label><input id="fRankMax" class="input" type="number" min="0" placeholder="如 200000"></div>
         <div class="filter-item"><label>评分 ≥ (空=不限)</label><input id="fRating" class="input" type="number" min="0" max="5" step="0.1" placeholder="如 4.0"></div>
-        <div class="filter-item"><label>A+ 页面</label><select id="fAplus" class="select"><option value="">不限</option><option value="1">仅有 A+</option><option value="0">排除 A+</option></select></div>
+        <div class="filter-item"><label>页面标识 (排除法, 逗号分隔, 命中任一即剔除)</label><input id="fBadgeNot" class="input" list="fBadgeNotList" placeholder="如: A+,AC,BestSeller,新品 (空=不限)"><datalist id="fBadgeNotList"><option value="A+"></option><option value="AC"></option><option value="BestSeller"></option><option value="NewRelease"></option><option value="限时优惠"></option><option value="新品"></option></datalist></div>
+        <div class="filter-item"><label>排名 (空=不限)</label><div style="font-size:12px"><label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="fHasRankOnly"> 排除没有排名的商品 (只看有排名)</label></div></div>
         <div class="filter-item"><label>商标数 ≤ (空=不限)</label><input id="fTmMax" class="input" type="number" min="0" placeholder="如 50"></div>
         <div class="filter-item"><label>卖家地区</label><select id="fChina" class="select"><option value="">全部</option><option value="1">中国卖家</option><option value="0">非中国卖家</option></select></div>
         <div class="filter-item">
@@ -1276,7 +1413,7 @@ async function renderProduct() {
       <table id="cTable" style="min-width:1400px">
       <thead><tr>
         <th style="width:34px"><input type="checkbox" id="cAll"></th>
-        <th>排名</th><th>ASIN</th><th>商品</th><th>品牌</th><th>备案/商标</th><th>配送</th><th>价格</th><th>30天销量</th><th>榜单排名</th><th>标签</th><th>卖家</th><th>跟卖数</th><th>站点</th><th>上架时间</th><th>操作</th>
+        <th title="父类排名 (宽类目). 采不到时显示「未采到」, 不再用子类排名顶替">父类排名</th><th>跟卖数</th><th>价格</th><th>操作</th><th>商品</th><th>品牌</th><th>备案/商标</th><th>配送</th><th>30天销量</th><th>ASIN</th><th>细分排名</th><th>标签</th><th>卖家</th><th>站点</th><th>上架时间</th>
       </tr></thead><tbody></tbody></table>
       </div>
       <!-- 粘性横向滚动条 (跟随视口) -->
@@ -1293,8 +1430,9 @@ async function renderProduct() {
   const tbody = $('#cTable tbody');
 
   const selected = new Set();
-  let page = 1;
-  let pageSize = 50;
+  // 页码/每页条数初值取上次记忆: 刷新页面、切走再回来都还在当前页(不再是每次回第 1 页)
+  let page = Math.max(1, Number(readPmList().page) || 1);
+  let pageSize = [20, 50, 100, 200].indexOf(Number(readPmList().size)) >= 0 ? Number(readPmList().size) : 50;
 
   // ===== 粘性横向滚动条: 与表格容器双向同步 =====
   const tableWrap = $('#cTableWrap');
@@ -1325,11 +1463,16 @@ async function renderProduct() {
     // 分页切片
     const total = items.length;
     const pages = Math.max(1, Math.ceil(total / pageSize));
-    if (page > pages) page = pages;
+    const hasData = items.length > 0;
+    // ★ 越界回收只在「真有数据」时做: 首次渲染/刷新后数据还没回来的那一刻 items 是空的,
+    //   pages 会是 1 —— 那时回收会把记忆里的页码冲成 1(刷新一次记忆就没了, 实测踩到)。
+    if (hasData && page > pages) page = pages;         // 删了商品/换了每页条数 → 收到最后一页
+    // 注意: 页码**不在这里落盘** —— 只有用户真的点了翻页/改了每页条数/改了筛选才写。
+    // (renderList 会被很多程序化路径调用, 在里面写盘会把记忆值冲成 1 —— 这正是"刷新后回第 1 页"的根因)
     const start = (page - 1) * pageSize;
     const pageItems = items.slice(start, start + pageSize);
     // 更新分页信息
-    $('#cPageInfo').textContent = `第 ${page}/${pages} 页 · 共 ${total} 条`;
+    $('#cPageInfo').textContent = `第 ${hasData ? page : 1}/${pages} 页 · 共 ${total} 条`;
     $('#cPagePrev').disabled = page <= 1;
     $('#cPageNext').disabled = page >= pages;
     tbody.innerHTML = pageItems.map((p) => {
@@ -1347,37 +1490,41 @@ async function renderProduct() {
         : p.trademarkCount > 0 ? `<span class="badge medium"${tmHint}>${p.trademarkCount}商标${tmCountBadge}</span>`
         : p.brandStatus === 'notfound' || (p.brandStatus == null && p.source === 'cdp-panel') ? '<span class="badge low">未查到</span>'
         : '<span class="badge low">未查到</span>';
-      // 榜单排名 (cdp-panel 商品有 bsr 数组)
-      const bsrTxt = Array.isArray(p.bsr) && p.bsr.length ? p.bsr.map((b) => `<span class="pill">#${esc(b.rank)} ${esc(b.category.slice(0, 18))}</span>`).join('') : (p.rank || '-');
-      const bsrArr = Array.isArray(p.bsr) && p.bsr.length ? p.bsr : [];
-      const bigRank = p.rank || (bsrArr.length ? '#' + Math.max(...bsrArr.map((b) => b.rank)) : '');
-      const smallRank = bsrArr.length ? Math.min(...bsrArr.map((b) => b.rank)) : null;
+      // ★ 父类 / 子类排名严格分离 (2026-09-14 修正): 只认后端独立字段 rankParent / rankChild, 绝不从 rank / bsr 里猜。
+      //   原因: rank 是"所有可用排名里的最大值"(供筛选用), 当商品只有子类排名时它装的就是子类数值 ——
+      //   此前用它当父类排名显示, 于是"父类排名"和"子类排名"看起来永远是同一个数字(即"没有分隔开")。
+      const bsrTxt = (p.rankChild != null)
+        ? `<span class="pill">#${esc(p.rankChild)} ${esc(String(p.rankChildCat || '').slice(0, 18))}</span>`
+        : (Array.isArray(p.bsr) && p.bsr.length ? p.bsr.map((b) => `<span class="pill">#${esc(b.rank)} ${esc(String(b.category || '').slice(0, 18))}</span>`).join('') : '-');
+      const bigRank = (p.rankParent != null) ? '#' + p.rankParent : '';
+      const smallRank = (p.rankChild != null) ? p.rankChild : null;
       // 商品亚马逊链接 (按站点生成跳转链接)
       const amzHost = 'www.amazon.' + ({ uk: 'co.uk', us: 'com', jp: 'co.jp', au: 'com.au', mx: 'com.mx', br: 'com.br', de: 'de', fr: 'fr', it: 'it', es: 'es', ca: 'ca', in: 'in' }[p.site] || p.site || 'de');
       return `<tr>
         <td><input type="checkbox" class="row-cb" value="${esc(p.asin)}" ${selected.has(p.asin) ? 'checked' : ''}></td>
-        <td class="muted">${esc(p.rank || '-')}</td>
-        <td class="mono">${esc(p.asin)}</td>
-        <td style="max-width:400px"><div style="display:flex;align-items:center;gap:8px">${bigRank ? `<span class="big-rank" title="大排名">${esc(bigRank)}</span>` : ''}${p.mainImage ? `<img src="${esc(p.mainImage)}" alt="" title="点击查看详情" class="p-main-img" data-asin="${esc(p.asin)}" loading="lazy">` : `<span class="p-main-img ph" data-asin="${esc(p.asin)}" title="点击查看详情"></span>`}<a class="title-link" data-asin="${esc(p.asin)}" title="点击查看详情">${esc(p.title.slice(0, 55))}${p.title.length > 55 ? '…' : ''}</a></div></td>
-        <td><b>${esc(p.brand)}</b></td>
-        <td>${bs}</td>
-        <td>${fulfill}</td>
-        <td>${p.minPrice != null ? '<b>' + fmtMoney(p.minPrice, p.currency) + '</b>' + (p.buyBoxPrice != null && p.buyBoxPrice !== p.minPrice ? `<br><span class="muted" title="BuyBox价">${fmtMoney(p.buyBoxPrice, p.currency)}</span>` : '') : fmtMoney(p.price, p.currency)}</td>
-        <td>${fmtNum(p.monthlySales)}</td>
-        <td style="max-width:190px">${bsrTxt}${smallRank != null && (!bsrArr.length || smallRank !== Math.max(...bsrArr.map((b) => b.rank))) ? `<div class="small-rank" title="小排名 (细分类目)">小 ${fmtNum(smallRank)}</div>` : ''}</td>
-        <td style="white-space:nowrap">${(p.badge === 'bestseller' ? '<span class="badge gold">Best</span>' : p.badge === 'choice' ? '<span class="badge blue">⭐ A</span>' : p.badge === 'deal' ? '<span class="badge danger">Deal</span>' : p.badge === 'newrelease' ? '<span class="badge newrelease">新品</span>' : '')}${p.aplus ? '<span class="badge aplus">A+</span>' : ''}${p.is1688 ? (p.is1688Url ? `<a class="badge b1688" href="${esc(p.is1688Url)}" target="_blank" rel="noopener" title="打开 1688 同款商品">1688</a>` : '<span class="badge b1688" title="有 1688 同款 (可找货源)">1688</span>') : ''}${p.bgMark ? '<span class="badge danger" title="BG标 (蓝色品牌标, 已备案品牌)">BG</span>' : ''}${p.tmMark ? '<span class="badge medium" title="TM标 (商标申请中)">TM</span>' : ''}${p.patentRisk ? '<span class="badge danger" title="专利库风险匹配">专利</span>' : ''}</td>
-        <td>${esc(p.sellerId || '')}${p.chinaSeller ? '<br><span class="badge danger">中国卖家</span>' : ''}</td>
+        <td class="muted" title="父类排名 (宽类目). 未采到 = 采集时没拿到插件面板的「店铺选品」排名, 可用「补采排名」补; 这不是子类排名">${p.rankParent != null ? esc('#' + p.rankParent) : '<span style="opacity:.55">未采到</span>'}</td>
         <td>${p.followCount ?? '-'}</td>
-        <td class="muted">${esc(p.site || '-')}</td>
-        <td class="muted" style="white-space:nowrap">${esc(p.listedAt || '-')}</td>
+        <td>${p.minPrice != null ? '<b>' + fmtMoney(p.minPrice, p.currency) + '</b>' + (p.buyBoxPrice != null && p.buyBoxPrice !== p.minPrice ? `<br><span class="muted" title="BuyBox价">${fmtMoney(p.buyBoxPrice, p.currency)}</span>` : '') : fmtMoney(p.price, p.currency)}</td>
         <td style="white-space:nowrap">
           <a class="btn small" href="${esc('https://' + amzHost + '/dp/' + p.asin)}" target="_blank" rel="noopener" title="在亚马逊打开商品">⧉ 链接</a>
+          <button class="btn small row-backfill" data-asin="${esc(p.asin)}" title="补采这一个商品: 重读详情页字段 + 插件面板(商标/月销), 只作用于本行, 无需勾选">补采</button>
           <button class="btn small row-save" data-asin="${esc(p.asin)}" title="${p.saved ? '取消保存' : '保存到产品库'}">${p.saved ? '★' : '☆'}</button>
           <button class="btn small row-claim" data-asin="${esc(p.asin)}" title="认领到草稿箱"></button>
           <button class="btn small row-del" data-asin="${esc(p.asin)}" title="删除"></button>
         </td>
+        <td style="max-width:400px"><div style="display:flex;align-items:center;gap:8px">${bigRank ? `<span class="big-rank" title="父类排名 (宽类目)">${esc(bigRank)}</span>` : ''}${p.mainImage ? `<img src="${esc(p.mainImage)}" alt="" title="点击查看详情" class="p-main-img" data-asin="${esc(p.asin)}" loading="lazy">` : `<span class="p-main-img ph" data-asin="${esc(p.asin)}" title="点击查看详情"></span>`}<a class="title-link" data-asin="${esc(p.asin)}" title="点击查看详情">${esc(p.title.slice(0, 55))}${p.title.length > 55 ? '…' : ''}</a></div></td>
+        <td><b>${esc(p.brand)}</b></td>
+        <td>${bs}</td>
+        <td>${fulfill}</td>
+        <td>${fmtNum(p.monthlySales)}</td>
+        <td class="mono">${esc(p.asin)}</td>
+        <td style="max-width:190px">${bsrTxt}${smallRank != null ? `<div class="small-rank" title="子类排名 (细分类目)">小 ${fmtNum(smallRank)}</div>` : ''}</td>
+        <td style="white-space:nowrap">${(p.badge === 'bestseller' ? '<span class="badge gold">Best</span>' : p.badge === 'choice' ? '<span class="badge blue">⭐ A</span>' : p.badge === 'deal' ? '<span class="badge danger">Deal</span>' : p.badge === 'newrelease' ? '<span class="badge newrelease">新品</span>' : '')}${p.aplus ? '<span class="badge aplus">A+</span>' : ''}${p.is1688 ? (p.is1688Url ? `<a class="badge b1688" href="${esc(p.is1688Url)}" target="_blank" rel="noopener" title="打开 1688 同款商品">1688</a>` : '<span class="badge b1688" title="有 1688 同款 (可找货源)">1688</span>') : ''}${p.bgMark ? '<span class="badge danger" title="BG标 (蓝色品牌标, 已备案品牌)">BG</span>' : ''}${p.tmMark ? '<span class="badge medium" title="TM标 (商标申请中)">TM</span>' : ''}${p.patentRisk ? '<span class="badge danger" title="专利库风险匹配">专利</span>' : ''}</td>
+        <td>${esc(p.sellerId || '')}${p.chinaSeller ? '<br><span class="badge danger">中国卖家</span>' : ''}</td>
+        <td class="muted">${esc(p.site || '-')}</td>
+        <td class="muted" style="white-space:nowrap">${esc(p.listedAt || '-')}</td>
       </tr>`;
-    }).join('') || '<tr><td colspan="15" class="empty">无匹配商品 (可点击「📡 去采集」添加)</td></tr>';
+    }).join('') || '<tr><td colspan="16" class="empty">无匹配商品 (可点击「📡 去采集」添加)</td></tr>';
 
     // 事件绑定
     $$('.title-link', tbody).forEach((a) => a.addEventListener('click', () => openProductDetail(a.dataset.asin)));
@@ -1398,10 +1545,11 @@ async function renderProduct() {
       });
     }));
     $$('.p-main-img', tbody).forEach((im) => im.addEventListener('click', () => {
-      // 有主图 → 大图灯箱; 占位 → 打开详情
+      // 有主图 → 大图灯箱(带放大镜); 占位 → 打开详情
       if (im.tagName === 'IMG') openImageLightbox(im.src, im.closest('tr') ? im.closest('tr').querySelector('.title-link')?.textContent || '' : '');
       else openProductDetail(im.dataset.asin);
     }));
+    // 主图: 悬停预览已删(2026-09), 只保留点击打开放大镜灯箱
     $$('.row-cb', tbody).forEach((cb) => cb.addEventListener('change', () => {
       if (cb.checked) selected.add(cb.value); else selected.delete(cb.value);
       updateSel();
@@ -1419,6 +1567,11 @@ async function renderProduct() {
       await API('/api/products/delete', { method: 'POST', body: JSON.stringify({ asins: [b.dataset.asin] }) });
       selected.delete(b.dataset.asin);
       reload();
+    }));
+    // 行内「补采」: 只补这一行 (无需勾选)。绑在 renderList 内 —— 表格每次重绘都会重建这些按钮节点。
+    $$('.row-backfill', tbody).forEach((b) => b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      runBackfill([b.dataset.asin]);
     }));
 
     // 渲染后更新粘性滚动条轨道宽度
@@ -1438,7 +1591,6 @@ async function renderProduct() {
     const q = new URLSearchParams();
     if ($('#cFba').value) q.set('fba', $('#cFba').value);
     if ($('#cSell').value) q.set('sell', $('#cSell').value);
-    if ($('#cAplus').value !== '') q.set('aplus', $('#cAplus').value);   // 独立 A+ 筛选: 1=仅有 / 0=排除
     if ($('#cBadge').value) q.set('badge', $('#cBadge').value);
     if ($('#cSearch').value) q.set('q', $('#cSearch').value);
     // 自定义筛选
@@ -1446,7 +1598,8 @@ async function renderProduct() {
     if ($('#fSalesRange').value) q.set('salesRange', $('#fSalesRange').value);
     if ($('#fRankMax').value) q.set('rankMax', $('#fRankMax').value);
     if ($('#fRating').value) q.set('ratingMin', $('#fRating').value);
-    if ($('#fAplus').value !== '') q.set('aplus', $('#fAplus').value);
+    if ($('#fBadgeNot').value) q.set('badgeNot', $('#fBadgeNot').value);      // ★ 页面标识(排除法)
+    if ($('#fHasRankOnly').checked) q.set('hasRankOnly', '1');                // ★ 排除没有排名的商品 (只看有排名)
     if ($('#fTmMax').value) q.set('tmMax', $('#fTmMax').value);
     if ($('#fChina').value !== '') q.set('china', $('#fChina').value);
     // 站点多选 (checkbox 面板)
@@ -1460,13 +1613,22 @@ async function renderProduct() {
     renderList(items, false);
   };
   const getSelAsins = () => [...selected];
-  // 搜索/筛选变更 → 回到第一页
-  const reloadFromTop = () => { page = 1; reload(); };
+  // 搜索/筛选变更 → 回到第一页。
+  // ★ 必须判断"值真的变了": 初始化/程序化触发的 change(值没变)如果也重置页码,
+  //   就会出现「刷新后明明记住了第 3 页, 一进页面又被顶回第 1 页」(实测踩到)。
+  const filterSnap = () => [$('#cFba').value, $('#cSell').value, $('#cBadge').value, $('#cSearch').value].join('\u0001');
+  let lastFilterSnap = filterSnap();
+  const reloadFromTop = () => {
+    const snap = filterSnap();
+    if (snap === lastFilterSnap) { reload(); return }     // 值没变 → 只刷新数据, 不动页码
+    lastFilterSnap = snap;
+    page = 1; writePmList({ page: 1, size: pageSize });   // 用户真的改了筛选 → 回第 1 页并记下来
+    reload();
+  };
 
   $('#cSearch').addEventListener('input', reloadFromTop);
   $('#cFba').addEventListener('change', reloadFromTop);
   $('#cSell').addEventListener('change', reloadFromTop);
-  $('#cAplus').addEventListener('change', reloadFromTop);
   $('#cBadge').addEventListener('change', reloadFromTop);
   // 自定义筛选面板开关
   $('#cFilter').addEventListener('click', () => {
@@ -1493,6 +1655,65 @@ async function renderProduct() {
     btn.textContent = '补采排名'; btn.disabled = false;
     reload();
   });
+
+  // ===== 补采 (只针对指定商品): 详情页字段 + 插件面板 + 可选 aod 跟卖 =====
+  // 为什么需要它: 采集链路已统一"不跳详情页", 详情页专属字段(价格/主图/评分/评论/类目/BSR/A+)
+  // 和插件面板字段(商标/月销/尺寸重量/FBA费用)改由这里按需补 —— 所以它是详情数据的唯一入口。
+  // 两步都是串行 CDP: 详情约 8s/个, 面板约 15~40s/个; 全程可点「停止」中断, 已采数据都会入库。
+  const runBackfill = async (asins) => {
+    const list = [...new Set((asins || []).filter(Boolean))];
+    // ★ 未勾选就提示 (不默认跑全库 —— 那是几小时的事)
+    if (!list.length) {
+      await zyAlert('⚠️ 请先勾选商品', '「一键补采」只作用于<b>勾选</b>的商品, 不会自动补全库。<br>请先勾选商品前面的方框, 或直接点某一行的「补采」按钮。');
+      return;
+    }
+    const f = await zyPromptForm(`🔄 补采 ${list.length} 个商品`, [
+      { field: 'depth', label: '补采内容', type: 'select', default: 'both', options: [
+        { value: 'both', label: '详情字段 + 插件面板 (推荐)' },
+        { value: 'detail', label: '只补详情字段 (价格/主图/评分/评论/类目/BSR/A+)' },
+        { value: 'panel', label: '只补插件面板 (商标/月销/尺寸重量/FBA费用)' },
+        { value: 'both_aod', label: '详情 + 面板 + aod 跟卖卖家 (最慢)' },
+      ] },
+    ], { hint: '详情约 8 秒/个, 插件面板约 15~40 秒/个, 串行执行; 可随时在「商品采集」页点「停止」中断 (已采数据已入库)。' });
+    if (!f) return;
+    const depth = f.depth || 'both';
+    const doDetail = depth === 'both' || depth === 'detail' || depth === 'both_aod';
+    const doPanel = depth === 'both' || depth === 'panel' || depth === 'both_aod';
+    const doAod = depth === 'both_aod';
+    const btn = $('#cBackfill');
+    if (btn) { btn.disabled = true; btn.textContent = '补采中…'; }
+    const poll = setInterval(async () => {
+      try { const pg = await API('/api/collect/progress'); if (pg && pg.running) $('#cCount').textContent = `补采中: ${pg.items || 0} 个, 已补 ${pg.added || 0}`; } catch {}
+    }, 2000);
+    const lines = [];
+    try {
+      if (doDetail) {
+        const r = await API('/api/products/refresh-detail', { method: 'POST', body: JSON.stringify({ asins: list }) });
+        if (r.error) throw new Error('详情补采失败: ' + r.error);
+        lines.push(`详情字段: 处理 <b>${r.total || 0}</b> 个, 成功 <b>${r.fixed || 0}</b>, 失败 ${r.failed || 0}`);
+      }
+      if (doPanel) {
+        const r = await API('/api/products/panel-refresh', { method: 'POST', body: JSON.stringify({ asins: list }) });
+        if (r.error) throw new Error('面板补采失败: ' + r.error);
+        lines.push(`插件面板: 更新 <b>${r.updated || 0}</b> 个, 失败 ${r.failed || 0}${r.note ? ' (' + esc(r.note) + ')' : ''}`);
+      }
+      if (doAod) {
+        const r = await API('/api/collect/follow-shop-aod', { method: 'POST', body: JSON.stringify({ urls: list, maxItems: 10, maxPages: 1, concurrency: 4, excludeSellers: '', amazonWords: 'amazon,亚马逊' }) });
+        if (r.error) throw new Error('aod 跟卖补采失败: ' + r.error);
+        lines.push(`aod 跟卖: 店铺成功 <b>${r.shopOk || 0}</b>, 失败 ${r.shopFail || 0}, 采到商品 <b>${r.productCount || 0}</b> 个, 新增 ${r.added || 0}`);
+      }
+      clearInterval(poll);
+      await zyAlert('✅ 补采完成', lines.join('<br>') + `<div class="muted" style="margin-top:6px">共 ${list.length} 个商品</div>`);
+    } catch (e) {
+      clearInterval(poll);
+      await zyAlert('❌ 补采失败', ((e && e.message) || e) + (lines.length ? '<br><br>已完成:<br>' + lines.join('<br>') : ''));
+    }
+    if (btn) { btn.disabled = false; btn.textContent = '一键补采'; }
+    reload();
+  };
+  // 一键补采: 只作用于勾选商品 (未勾选 → runBackfill 内部提示)
+  $('#cBackfill').addEventListener('click', () => runBackfill(getSelAsins()));
+
   // 批量 1688 图搜找货: 选中商品 → 逐个上传主图到 1688 以图搜图 → 自动存第一个同款货源
   $('#c1688Search').addEventListener('click', async () => {
     const sel = getSelAsins();
@@ -1527,18 +1748,28 @@ async function renderProduct() {
     const rows = results.map((x) => `<div style="padding:2px 0">${x.asin}: ${x.error ? '✗ ' + x.error : '找到 ' + x.count + ' 个同款, 已存 ' + x.stored + ' 个'}</div>`).join('');
     await zyAlert('✅ 1688 批量图搜完成', `共处理 <b>${results.length}</b> 个商品, <b>${ok}</b> 个找到同款货源 (已自动存入第一个货源到商品)<div style="margin-top:6px;background:#f6f6f6;border-radius:6px;padding:8px;font-size:12px;max-height:240px;overflow-y:auto">${rows}</div>`);
   });
-  $('#fApply').addEventListener('click', () => { page = 1; reload(); });
+  $('#fApply').addEventListener('click', () => { page = 1; writePmList({ page: 1, size: pageSize }); reload(); });
   // 商品管理页类目联动 (一级 → 二级), 切换后自动刷新列表
-  bindCategoryTree('fCat1', 'fCat2', () => { page = 1; reload(); });
+  // 类目树选择同样只在"值真的变了"时回第 1 页 —— 初始化/恢复筛选时派发的 change 不该重置页码
+  const catSnap = () => (($('#fCat1') || {}).value || '') + '\u0001' + (($('#fCat2') || {}).value || '');
+  let lastCatSnap = catSnap();
+  bindCategoryTree('fCat1', 'fCat2', () => {
+    const snap = catSnap();
+    if (snap === lastCatSnap) { reload(); return }
+    lastCatSnap = snap;
+    page = 1; writePmList({ page: 1, size: pageSize });
+    reload();
+  });
   $('#fReset').addEventListener('click', () => {
     ['fPriceRange', 'fSalesRange', 'fRankMax', 'fRating', 'fTmMax'].forEach((id) => { $('#' + id).value = ''; });
-    $('#fAplus').value = '';
+    $('#fBadgeNot').value = '';
+    $('#fHasRankOnly').checked = false;
     $('#fChina').value = '';
     $('#fCat1').value = ''; $('#fCat1').dispatchEvent(new Event('change'));
     $('#fCat2').value = '';
     document.querySelectorAll('#fSitePanel input[type="checkbox"]').forEach((c) => { c.checked = false; });
     updateSiteTrigger();
-    page = 1;
+    page = 1; writePmList({ page: 1, size: pageSize });     // 用户点了"清除筛选" → 回第 1 页并记住
     reload();
   });
   // 站点多选下拉: 展开/收起 + 状态更新
@@ -1559,17 +1790,17 @@ async function renderProduct() {
   });
   $('#fSiteApply').addEventListener('click', () => {
     $('#fSitePanel').classList.remove('open');
-    page = 1;
+    page = 1; writePmList({ page: 1, size: pageSize });    // 用户改了站点筛选 → 回第 1 页并记住
     reload();
   });
   document.addEventListener('click', () => $('#fSitePanel').classList.remove('open'));
-  // 翻页
-  $('#cPagePrev').addEventListener('click', () => { if (page > 1) { page--; renderList(items, false); } });
+  // 翻页（★ 用户操作 → 立刻落盘, 这是"保持当前页"的落盘点)
+  $('#cPagePrev').addEventListener('click', () => { if (page > 1) { page--; writePmList({ page, size: pageSize }); renderList(items, false); } });
   $('#cPageNext').addEventListener('click', () => {
     const pages = Math.max(1, Math.ceil(items.length / pageSize));
-    if (page < pages) { page++; renderList(items, false); }
+    if (page < pages) { page++; writePmList({ page, size: pageSize }); renderList(items, false); }
   });
-  $('#cPageSize').addEventListener('change', (e) => { pageSize = parseInt(e.target.value, 10); page = 1; renderList(items, false); });
+  $('#cPageSize').addEventListener('change', (e) => { pageSize = parseInt(e.target.value, 10); page = 1; writePmList({ page: 1, size: pageSize }); renderList(items, false); });
   $('#cAll').addEventListener('change', (e) => {
     const checked = e.target.checked;
     $$('.row-cb', tbody).forEach((cb) => { cb.checked = checked; if (checked) selected.add(cb.value); else selected.delete(cb.value); });
@@ -1661,7 +1892,7 @@ async function renderCollect() {
     { mode: 'bulk', icon: 'layers', name: '并行整站采集', desc: '一次并行打开N个搜索页, 批量聚合大量商品' },
     { mode: 'catmenu', icon: 'list', name: '类目菜单采集', desc: '首页 → 大类目 → 二级类目 → 查看所有结果 → 商品' },
   ];
-  // Amazon 页面标识标签 (商品卡/详情页徽章, 多选=含任一即可)
+  // Amazon 页面标识标签 (商品卡/详情页徽章) —— 面板已改为【排除法】: 填进去的标识命中即剔除
   const BADGE_OPTIONS = [
     { value: 'aplus', label: 'A+ 内容' },
     { value: 'choice', label: "Amazon's Choice (AC)" },
@@ -1696,7 +1927,8 @@ async function renderCollect() {
         <div class="filter-item"><label>A+ 店铺 (仅跟卖店铺采集)</label><select id="cfShopAplus" class="select"><option value="">不限</option><option value="1">仅有 A+ 店铺</option><option value="0">排除 A+ 店铺</option></select></div>
         <div class="filter-item"><label>品牌店铺 (仅跟卖店铺采集)</label><select id="cfBrandShop" class="select"><option value="">不限</option><option value="0">排除品牌店铺</option><option value="1">仅品牌店铺</option></select></div>
         <div class="filter-item"><label>品牌店筛选 (仅跟卖店铺采集, 空=不限)</label><input id="cfBrandStore" class="input" list="cfBrandList" placeholder="品牌名如 Anker 只采该品牌; 填 ! 排除所有带 Visit the X Store 链接的店铺"><datalist id="cfBrandList"><option value="Anker"></option><option value="Samsung"></option><option value="Apple"></option><option value="Xiaomi"></option><option value="Sony"></option><option value="Philips"></option><option value="Bosch"></option><option value="Logitech"></option><option value="! 排除所有品牌店链接"></option></datalist></div>
-        <div class="filter-item"><label>排名 BSR 区间 (空=不限)</label><input id="cfRankRange" class="input" placeholder="如 10000-500000"></div>
+        <div class="filter-item"><label>大排名区间 (空=不限)</label><input id="cfRankRange" class="input" placeholder="如 1-200000 (大排名 = 店铺选品/所有排名取最大)"></div>
+        <div class="filter-item"><label>排名 (空=不限)</label><div style="font-size:12px;padding-top:6px"><label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="cfHasRankOnly"> 排除没有排名的商品 (只看有排名)</label></div></div>
         <div class="filter-item"><label>价格区间 (€/£/$, 空=不限)</label><input id="cfPriceRange" class="input" placeholder="如 10-100"></div>
         <div class="filter-item"><label>评分区间 (空=不限)</label><input id="cfRatingRange" class="input" placeholder="如 3.5-4.8"></div>
         <div class="filter-item"><label>评论数区间 (空=不限)</label><input id="cfReviewsRange" class="input" placeholder="如 50-5000"></div>
@@ -1706,8 +1938,8 @@ async function renderCollect() {
         <div class="filter-item"><label>1688 同款</label><select id="cfIs1688" class="select"><option value="">不限</option><option value="1">仅有 1688 同款</option><option value="0">排除 1688 同款</option></select></div>
         <div class="filter-item"><label>品牌状态</label><select id="cfBrandStatus" class="select"><option value="">不限</option><option value="registered">排除已备案品牌</option><option value="tm">排除 TM 申请中</option><option value="notfound">仅未查到品牌</option></select></div>
         <div class="filter-item"><label>商标国家排除 (逗号分隔, 空=不限)</label><input id="cfTmCountries" class="input" list="cfTmCountryList" placeholder="如: 欧盟,英国,美国"><datalist id="cfTmCountryList"><option value="欧盟"></option><option value="英国"></option><option value="美国"></option><option value="德国"></option><option value="日本"></option><option value="中国"></option><option value="法国"></option><option value="意大利"></option><option value="西班牙"></option><option value="马德里"></option></datalist></div>
-        <div class="filter-item badge-multi"><label>页面标识 (逗号分隔, 含任一即可; 可手写如: A+,AC,BestSeller,新品,限时)</label>
-          <input id="cfBadges" class="input" list="cfBadgeList" placeholder="如: A+,AC,BestSeller,NewRelease 或 新品,畅销 (空=不限)">
+        <div class="filter-item badge-multi"><label>页面标识 (排除法: 逗号分隔, 命中任一即剔除; 可手写如: A+,AC,BestSeller,新品,限时)</label>
+          <input id="cfBadgesNot" class="input" list="cfBadgeList" placeholder="如: A+,AC,BestSeller 或 新品,畅销 (空=不限)">
           <datalist id="cfBadgeList">${BADGE_OPTIONS.map((b) => `<option value="${b.label}">`).join('')}</datalist>
         </div>
         <div class="filter-item"><label>标题含关键词 (可输可选)</label><input id="cfQ" class="input" list="cfQList" placeholder="如: anker"><datalist id="cfQList"><option value="anker"></option><option value="usb"></option><option value="phone"></option><option value="case"></option><option value="holder"></option><option value="adapter"></option><option value="charger"></option><option value="cable"></option><option value="watch"></option><option value="gaming"></option></datalist></div>
@@ -1764,11 +1996,12 @@ async function renderCollect() {
     if ((v.filterBrandStore || '').startsWith('!')) parts.push('排除品牌店链接');
     else if (v.filterBrandStore) parts.push('品牌店=' + v.filterBrandStore);
     const r1 = parseRange(v.filterRankRange), r2 = parseRange(v.filterPriceRange), r3 = parseRange(v.filterRatingRange), r4 = parseRange(v.filterReviewsRange), r5 = parseRange(v.filterSalesRange), r6 = parseRange(v.filterTmRange), r7 = parseRange(v.filterNewDaysRange);
-    if (fmtRange(r1.min, r1.max)) parts.push('BSR:' + fmtRange(r1.min, r1.max));
+    if (fmtRange(r1.min, r1.max)) parts.push('大排名:' + fmtRange(r1.min, r1.max));
+    if (v.filterHasRankOnly === '1') parts.push('仅看有排名(排除没有排名)');
     if (fmtRange(r2.min, r2.max)) parts.push('价:' + fmtRange(r2.min, r2.max));
     if (fmtRange(r3.min, r3.max)) parts.push('评分:' + fmtRange(r3.min, r3.max));
     if (fmtRange(r4.min, r4.max)) parts.push('评论:' + fmtRange(r4.min, r4.max));
-    if (v.filterBadges && v.filterBadges.length) parts.push('标识:' + v.filterBadges.map((b) => BADGE_LABELS[b] || b).join(','));
+    if (v.filterBadgesNot && v.filterBadgesNot.length) parts.push('排除标识:' + v.filterBadgesNot.map((b) => BADGE_LABELS[b] || b).join(','));
     if (v.filterQ) parts.push('标题含「' + v.filterQ + '」');
     if (fmtRange(r6.min, r6.max)) parts.push('排除商标:' + fmtRange(r6.min, r6.max));
     if (v.filterTmCountries) parts.push('排除商标国家:' + v.filterTmCountries);
@@ -1800,7 +2033,8 @@ async function renderCollect() {
   $('#cfSiteClear').addEventListener('click', () => { document.querySelectorAll('#cfSitePanel .cfSiteCb').forEach((c) => { c.checked = false; }); updateCfSiteTrigger(); updateCfActive(); });
   $('#cfSiteApply').addEventListener('click', () => { $('#cfSitePanel').classList.remove('open'); updateCfActive(); });
   document.addEventListener('click', () => $('#cfSitePanel').classList.remove('open'));
-  $('#cfBadges').addEventListener('input', updateCfActive);
+  $('#cfBadgesNot').addEventListener('input', updateCfActive);
+  $('#cfHasRankOnly').addEventListener('change', updateCfActive);
   ['cfFulfill', 'cfShopAplus', 'cfBrandShop', 'cfBrandStore', 'cfRankRange', 'cfPriceRange', 'cfRatingRange', 'cfReviewsRange', 'cfSalesRange', 'cfTmRange', 'cfNewDaysRange', 'cfIs1688', 'cfBrandStatus', 'cfTmCountries', 'cfQ', 'cfCat1', 'cfCat2'].forEach((id) => {
     const el = $('#' + id);
     if (el) el.addEventListener('input', updateCfActive);
@@ -1811,7 +2045,8 @@ async function renderCollect() {
     $$('.site-chip').forEach((el) => { el.classList.toggle('active', el.dataset.site === 'de'); });
     document.querySelectorAll('#cfSitePanel .cfSiteCb').forEach((el) => { el.checked = el.value === 'de'; });
     $('#cfCustomSites').value = '';
-    $('#cfBadges').value = '';
+    $('#cfBadgesNot').value = '';
+    $('#cfHasRankOnly').checked = false;
     updateCfSiteTrigger();
     // 重置一级类目后二级联动刷新
     const c1 = $('#cfCat1');
@@ -1891,10 +2126,12 @@ async function renderCollect() {
     const presetSites = SITE_GROUPS.flatMap((g) => g.sites.map((s) => s.value));
     document.querySelectorAll('#cfSitePanel .cfSiteCb').forEach((el) => { el.checked = siteList.includes(el.value); });
     $('#cfCustomSites').value = siteList.filter((s) => !presetSites.includes(s)).join(',');
-    // 标签文本回填 (旧规则 filterBadge 单值/filterAplus 兼容)
-    let badgeList = (Array.isArray(m.filterBadges) && m.filterBadges.length) ? m.filterBadges : (m.filterBadge ? [m.filterBadge] : []);
-    if (!badgeList.length && (m.filterAplus === '1' || m.filterAplus === true)) badgeList = ['A+'];
-    $('#cfBadges').value = badgeList.join(',');
+    // 页面标识回填 (排除法): 新字段 filterBadgesNot 优先; 旧规则的 filterBadges(含任一) 只能按排除法载入 → 在下方规则信息里明确提示
+    const legacyBadges = (Array.isArray(m.filterBadges) && m.filterBadges.length) ? m.filterBadges : (m.filterBadge ? [m.filterBadge] : []);
+    const badgeNotList = Array.isArray(m.filterBadgesNot) ? m.filterBadgesNot.filter(Boolean) : [];
+    const badgeLegacyOnly = !badgeNotList.length && legacyBadges.length > 0;
+    $('#cfBadgesNot').value = (badgeNotList.length ? badgeNotList : legacyBadges).join(',');
+    $('#cfHasRankOnly').checked = (m.filterHasRankOnly === '1' || m.filterHasRankOnly === true);
     // 类目回填: 英文匹配词 → 反查一级/二级下拉 (不匹配则动态补二级选项)
     const catV = m.filterCategory || '';
     const catNode = CATEGORY_TREE.find((c) => c.value === catV);
@@ -1912,7 +2149,9 @@ async function renderCollect() {
       c2.value = catV;
     }
     $('#cfRuleSelect').value = name;
-    $('#cfRuleInfo').textContent = `已加载规则「${name}」`;
+    $('#cfRuleInfo').textContent = `已加载规则「${name}」`
+      + (badgeLegacyOnly ? ' · ⚠ 旧规则的「页面标识(含任一)」已按新的排除法载入 (语义已变, 如需"仅有"请换其它条件)' : '')
+      + ((m.filterAplus === '1' || m.filterAplus === true) ? ' · ⚠ 旧规则的 A+ 字段已废弃 (A+ 现由「页面标识(排除法)」表达)' : '');
     updateCfActive();
   };
   fillRuleSelect(ruleList);
@@ -2058,7 +2297,8 @@ async function openProductDetail(asin) {
               <div class="muted" style="font-size:11px;margin-top:5px">商标已在如下国家注册</div>
             </span>
           </div>` : ''}
-          <div class="detail-item"><span class="k">榜单排名</span><span class="v">${esc(p.rank || '-')}</span></div>
+          <div class="detail-item"><span class="k">父类排名</span><span class="v">${p.rankParent != null ? esc('#' + p.rankParent + (p.rankParentCat ? '  ' + p.rankParentCat : '')) : '<span class="muted">未采到</span>'}</span></div>
+          <div class="detail-item"><span class="k">子类排名</span><span class="v">${p.rankChild != null ? esc('#' + p.rankChild + (p.rankChildCat ? '  ' + p.rankChildCat : '')) : '<span class="muted">未采到</span>'}</span></div>
           <div class="detail-item"><span class="k">类目</span><span class="v">${esc(p.category || '-')}</span></div>
           <div class="detail-item"><span class="k">站点</span><span class="v">${esc(p.site || '-')}</span></div>
           <div class="detail-item"><span class="k">当前价格(最低跟卖)</span><span class="v"><b>${fmtMoney(p.minPrice != null ? p.minPrice : p.price, p.currency)}</b></span></div>
@@ -2124,11 +2364,11 @@ async function openProductDetail(asin) {
             <div class="filter-item"><label>重量 (kg, 可改)</label><input id="dlProfitWeight" class="input" type="number" step="0.01" value=""></div>
             <div class="filter-item"><label>尺寸 (cm, 长×宽×高)</label><input id="dlProfitDims" class="input" placeholder="如 20x15x10"></div>
             <div class="filter-item"><label>货源成本 (¥, 采购价)</label><input id="dlProfitSupply" class="input" type="number" step="0.01" placeholder="1688 采购价 ¥"></div>
-            <div class="filter-item"><label>物流成本 (¥, 可手动填或自动试算)</label><input id="dlProfitLogi" class="input" type="number" step="0.01" placeholder="云途运费 ¥"></div>
+            <div class="filter-item"><label>物流成本 (¥, 可手动填或按报价表算)</label><input id="dlProfitLogi" class="input" type="number" step="0.01" placeholder="物流运费 ¥"></div>
           </div>
           <div id="dlProfitStatus" class="muted" style="font-size:11px;margin-top:6px"></div>
           <div id="dlProfitResult" style="margin-top:8px;font-size:13px"></div>
-          <div class="muted" style="font-size:11px;margin-top:4px">「一键计算」自动获取汇率 + 重量尺寸 + 货源成本, 并自动试算云途物流最低价 (约 30 秒); 也可手动填写后点「手动计算」。售价取最低跟卖价 ${esc(p.currency || '')}</div>
+          <div class="muted" style="font-size:11px;margin-top:4px">「一键计算」自动获取汇率 + 重量尺寸 + 货源成本, 并按报价表取物流最低价; 也可手动填写后点「手动计算」。售价取最低跟卖价 ${esc(p.currency || '')}</div>
         </div>
         <div class="toolbar">
           <button id="dlClaim" class="btn primary">认领到草稿箱</button>
@@ -2146,7 +2386,7 @@ async function openProductDetail(asin) {
           <span class="muted" style="font-size:12px;align-self:center">找货:</span>
           <button class="btn small primary src-btn" id="dl1688Find" title="点击后自动上传商品主图到 1688 以图搜图, 抓取同款货源并显示下方 (需已登录 1688)">1688 找货</button>
           ${sourceSearchUrls(p).map((s) => `<a class="btn small src-btn" href="${esc(s.url)}" target="_blank" rel="noopener" title="在${s.name}以图搜图找货源">${esc(s.name)}</a>`).join('')}
-          <button class="btn small" id="dlLogistics" title="按商品重量/尺寸 + 站点自动试算云途等物流渠道运费 (免费, 打开云途官网试算)">运费试算</button>
+          <button class="btn small" id="dlLogistics" title="按商品重量/尺寸 + 站点从本地报价表查运费 (报价表在「物流工具」里维护)">运费试算</button>
           <button id="dlClose" class="btn">关闭</button>
           <span class="muted" id="dlMsg"></span>
         </div>
@@ -2263,53 +2503,46 @@ async function openProductDetail(asin) {
     }
     btn.textContent = '1688 找货'; btn.disabled = false;
   });
-  // ===== 运费试算: 按商品重量/尺寸 + 站点 自动试算云途各渠道运费 =====
+  // ===== 运费试算: 按商品重量 + 站点, 查本地报价表(「物流工具」里维护首重/续重) =====
+  // (2026-09-20: 原「云途官网 CDP 免费试算」已删除 —— 后续物流价格改从智赢客户端「国际运费预估」UI 读取)
   $('#dlLogistics', mask).addEventListener('click', async () => {
     const btn = $('#dlLogistics', mask);
-    // 从商品数据解析重量 (g → kg) 和尺寸
     const parseNum = (s) => { const m = String(s || '').match(/[\d.]+/); return m ? parseFloat(m[0]) : null; };
     const weightG = parseNum(p.weight) || parseNum(p.packWeight) || 0;   // 克
-    const dims = (p.size || p.packSize || '').match(/[\d.]+/g) || [];
     const country = ({ uk: 'GB', de: 'DE', us: 'US', fr: 'FR', it: 'IT', es: 'ES', nl: 'NL', jp: 'JP', ca: 'CA', in: 'IN', au: 'AU' }[p.site] || 'GB');
     const weightKg = weightG > 0 ? weightG / 1000 : 1;
-    const len = dims[0] ? parseFloat(dims[0]) : 0;
-    const wid = dims[1] ? parseFloat(dims[1]) : 0;
-    const hgt = dims[2] ? parseFloat(dims[2]) : 0;
-    // 弹出参数确认 + 结果面板 (用 zyPromptForm 拿可调参数)
-    const f = await zyPromptForm('📦 物流运费试算 (云途官网, 免费)', [
-      { field: 'weight', label: `重量 (kg)${weightG ? `, 商品 ${weightG}g=${(weightG/1000).toFixed(2)}kg` : ', 商品无重量数据, 请填写'}`, type: 'number', default: String(weightKg) },
-      { field: 'len', label: '长 (cm, 可留空)', type: 'number', default: len ? String(len) : '' },
-      { field: 'wid', label: '宽 (cm, 可留空)', type: 'number', default: wid ? String(wid) : '' },
-      { field: 'hgt', label: '高 (cm, 可留空)', type: 'number', default: hgt ? String(hgt) : '' },
+    const f = await zyPromptForm('📦 物流运费试算 (本地报价表)', [
+      { field: 'weight', label: `重量 (kg)${weightG ? `, 商品 ${weightG}g=${(weightG / 1000).toFixed(2)}kg` : ', 商品无重量数据, 请填写'}`, type: 'number', default: String(weightKg) },
       { field: 'country', label: '目的国 (ISO2 代码)', default: country },
-      { field: 'battery', label: '带电商品', type: 'select', options: [{ value: '0', label: '否 (普货)' }, { value: '1', label: '是 (带电)' }], default: '0' },
-    ], { hint: `自动打开云途官网价格试算 (需能访问 yunexpress.cn), 约 25 秒。商品站点 ${p.site} → ${country}, 重量 ${weightKg}kg${len ? `, 尺寸 ${len}x${wid}x${hgt}cm` : ''}` });
+    ], { hint: `按「物流工具 → 报价表」维护的首重/续重费率试算。商品站点 ${p.site} → ${country}, 重量 ${weightKg}kg` });
     if (!f) return;
-    btn.textContent = '运费试算中…'; btn.disabled = true;
+    btn.textContent = '试算中…'; btn.disabled = true;
     try {
-      const r = await API('/api/logistics/quote', { method: 'POST', body: JSON.stringify({ originCity: '深圳市', country: f.country, weightKg: parseFloat(f.weight) || 1, lengthCm: parseFloat(f.len) || 0, widthCm: parseFloat(f.wid) || 0, heightCm: parseFloat(f.hgt) || 0, battery: f.battery === '1' }) });
-      if (!r.ok || !r.quotes || !r.quotes.length) {
-        await zyAlert('⚠️ 未获取到报价', (r && r.error) || '云途试算无结果 (可稍后重试)');
+      const cc = String(f.country || '').toUpperCase();
+      const r = await API('/api/logistics/rates?country=' + encodeURIComponent(cc) + '&weight=' + encodeURIComponent(f.weight));
+      const quotes = (r && r.quotes) || [];
+      if (!quotes.length) {
+        await zyAlert('⚠️ 报价表里没有该目的国', `目的国 ${cc} 在报价表里没有费率。请到「物流工具 → 报价表」添加该国各渠道的首重/续重价格。`);
         return;
       }
-      const rows = r.quotes.map((q) => `<tr>
-        <td>${esc(q.channel)}</td><td>${esc(q.type)}</td><td>${esc(q.parcel)}</td>
-        <td>${esc(q.eta)}</td><td><b>¥${q.total}</b></td>
-        <td class="muted" style="font-size:11px">运费¥${q.freight}${q.registrationFee ? '+挂号¥' + q.registrationFee : ''}</td>
+      const rows = quotes.map((q) => `<tr>
+        <td>${esc(q.channel)}</td><td>${esc(q.type)}</td><td>${esc(q.eta)}</td>
+        <td>首重 ${esc(String(q.firstWeight))}kg ¥${esc(String(q.firstPrice))}</td>
+        <td>续重 ${esc(String(q.contWeight))}kg ¥${esc(String(q.contPrice))}</td>
+        <td><b>¥${q.total}</b></td>
       </tr>`).join('');
-      await zyAlert('✅ 运费试算结果', `
-        <div class="muted" style="margin-bottom:6px">${esc(r.originCity)} → ${esc(r.country)} · ${r.weightKg}kg${r.lengthCm ? ` · ${r.lengthCm}x${r.widthCm}x${r.heightCm}cm` : ''} · ${r.battery ? '带电' : '普货'} · 共 ${r.quotes.length} 个渠道</div>
-        <table class="ov-table" style="width:100%"><thead><tr><th>渠道</th><th>类型</th><th>包裹</th><th>时效</th><th>总费用</th><th>明细</th></tr></thead><tbody>${rows}</tbody></table>
-        <div class="muted" style="font-size:11px;margin-top:6px">${esc(r.note)} · 数据来自云途官网实时试算</div>`);
-      // 联动: 自动把最低物流成本填入利润测算并重算
-      const best = r.quotes.filter((q) => q.total != null).sort((a, b) => a.total - b.total)[0];
+      await zyAlert('✅ 运费试算结果 (本地报价表)', `
+        <div class="muted" style="margin-bottom:6px">目的国 ${cc} · ${esc(String(f.weight))}kg · 报价表更新于 ${esc(r.updatedAt || '未记录')}</div>
+        <table class="ov-table" style="width:100%"><thead><tr><th>渠道</th><th>类型</th><th>时效</th><th>首重</th><th>续重</th><th>总费用</th></tr></thead><tbody>${rows}</tbody></table>
+        <div class="muted" style="font-size:11px;margin-top:6px">价格为报价表录入值, 请定期核对; 需要实时价可在智赢客户端「国际运费预估」里查。</div>`);
+      const best = quotes.filter((q) => q.total != null).sort((a, b) => a.total - b.total)[0];
       if (best) {
         window.__lastQuote = { min: best.total, channel: best.channel };
         const lgLogi = $('#dlProfitLogi', mask);
         if (lgLogi) { lgLogi.value = best.total; lgLogi.dispatchEvent(new Event('input', { bubbles: true })); }
       }
     } catch (e) {
-      await zyAlert('❌ 运费试算失败', (e && e.message) || '请确认云途官网可访问');
+      await zyAlert('❌ 运费试算失败', (e && e.message) || '请检查后端是否在运行');
     }
     btn.textContent = '运费试算'; btn.disabled = false;
   });
@@ -2382,7 +2615,8 @@ async function openProductDetail(asin) {
         if (!parseFloat($('#dlProfitSupply', mask).value)) {
           status.textContent = '⚠ 未填写货源成本, 请在"货源成本"输入 1688 采购价 (¥)';
         }
-        // 4. 自动算物流: 优先本地报价表 (稳定实时), 报价表无该国则尝试云途 CDP
+        // 4. 自动算物流: 用本地报价表(「物流工具」里维护)。
+        //    (2026-09-20: 原来"报价表没有就退回云途官网 CDP 试算"已删除 —— 后续实时物流价格改从智赢客户端「国际运费预估」UI 读取)
         const country = ({ uk: 'GB', de: 'DE', us: 'US', fr: 'FR', it: 'IT', es: 'ES', nl: 'NL', jp: 'JP', ca: 'CA', in: 'IN', au: 'AU' }[p.site] || 'GB');
         let best = null, source = '';
         status.textContent = '正在用报价表计算物流成本…';
@@ -2397,18 +2631,8 @@ async function openProductDetail(asin) {
           }
         }
         if (!best) {
-          // 报价表无数据 → 尝试云途 CDP (约 30 秒)
-          status.textContent = '报价表无该国数据, 正在尝试云途官网试算 (约 30 秒)…';
-          const q = await API('/api/logistics/quote', { method: 'POST', body: JSON.stringify({ originCity: '深圳市', country, weightKg: wKg2, lengthCm: len, widthCm: wid, heightCm: hgt, battery: false }) }).catch(() => ({}));
-          best = q && q.quotes && q.quotes.length ? q.quotes.filter((x) => x.total != null).sort((a, b) => a.total - b.total)[0] : null;
-          if (best) {
-            $('#dlProfitLogi', mask).value = best.total;
-            status.textContent = `✔ 物流自动试算: ${esc(best.channel.slice(0, 24))} ¥${best.total} (${esc(best.eta)})`;
-            doCalc({ channel: best.channel });
-          } else {
-            status.textContent = (q && q.error) ? `⚠ 物流试算失败: ${esc(q.error)} — 可手动填物流成本后点"手动计算"` : '⚠ 物流成本无来源 (报价表无该国 + 云途试算无结果) — 可手动填后点"手动计算"';
-            doCalc();
-          }
+          status.textContent = '⚠ 报价表里没有该目的国的费率 — 可到「物流工具 → 报价表」补录, 或手动填物流成本后点"手动计算"';
+          doCalc();
         }
       } catch (e) {
         status.textContent = '⚠ 一键计算失败: ' + esc((e && e.message) || e) + ' — 可手动填写后点"手动计算"';
@@ -2549,7 +2773,7 @@ async function renderClaims() {
             </tr>`).join('') || '<tr><td colspan="7" class="empty">无可认领商品</td></tr>'}</tbody>
           </table></div>
           <div class="toolbar section-gap">
-            <button id="claimSel" class="btn primary">认领选中</button>
+            <button id="claimSel" class="btn primary" title="打开所选商品的所有链接: 商品页 / 品牌页 / 卖家页 / 1688 同款 (逐个在新标签页打开)">🔗 打开所选链接</button>
             <button id="claimAll" class="btn">认领全部</button>
           </div>
         </div>
@@ -2593,7 +2817,15 @@ async function renderClaims() {
     await loadClaims();
     await zyAlert(`✔ 已认领 ${n} 个商品到草稿箱`);
   };
-  $('#claimSel').addEventListener('click', () => claimAsins($$('.claim-cb:checked').map((x) => x.value)));
+  // ★ 「认领选中」已改为「打开所选商品的所有链接」: 勾选商品 → 逐个打开它的商品页/品牌页/卖家页/1688
+  $('#claimSel').addEventListener('click', async () => {
+    const asins = $$('.claim-cb:checked').map((x) => x.value);
+    if (!asins.length) return await zyAlert('请先勾选商品', '勾选左侧列表里的商品后再点「打开所选链接」');
+    const picked = lowRisk.filter((p) => asins.indexOf(p.asin) >= 0);
+    // 列表里没有的(理论上不会)用 ASIN 兜一条商品页链接, 免得点了没反应
+    const rows = picked.length ? picked : asins.map((a) => ({ asin: a, site: '' }));
+    await openProductsLinks(rows);
+  });
   $('#claimAll').addEventListener('click', () => claimAsins(lowRisk.map((p) => p.asin)));
   $('#pubSel').addEventListener('click', async () => {
     const r = await API('/api/publish', { method: 'POST', body: JSON.stringify({ ids: $$('.pub-cb:checked').map((x) => x.value) }) });
@@ -2786,6 +3018,775 @@ async function renderKnowledge() {
   `;
 }
 
+/* ===== ★ 上架记录 (2026-09-24) =====
+ * 与「商品管理」的 products 库【物理隔离】的独立存储 (listing-records.json)。
+ * 数据来源: 自研采集器 v2 在 Amazon 商品详情页「📥 采集 → ✅ 入库」(含父ASIN/子体ASIN/选项/子体主图)。
+ * 上品工具 (ifast.top) 页面由扩展注入 #zying-listing-records 数据块可直接读取本页数据。
+ * 本页只做: 查看 / 改状态 / 删除 / 导出 —— 不写入 products, 也不参与商品库筛选。
+ */
+async function renderListing() {
+  const content = $('#content');
+  content.innerHTML = `
+    <div class="notice">📤 <b>上架记录</b> —— 与「商品管理」数据库<b>物理隔离</b>的独立清单。
+      由自研采集器 v2 在 Amazon <b>商品详情页</b>点「📥 采集 → ✅ 入库」写入(含 <b>父ASIN / 子体ASIN / 变体选项 / 子体主图</b>)。
+      上品工具 <code>ifast.top</code> 页面可直接读取扩展注入的 <code>#zying-listing-records</code> 数据块。<br>
+      <b>本页只负责"记录"</b> —— 而且状态数据只有一种: <b>上传结果</b>(成功 / <b>失败</b> / 还没有结果)。
+      "待填 / 待上传 / 已填未传"这类中间态已经删掉, 不再作为状态显示(排不排队由"有没有成功记录"推出来, 不占状态)。
+      上传与填表都在采集器 → ifast 那条链路上完成, 这里不放上传类按钮。</div>
+
+    <div class="card">
+      <div class="card-title">${ic ? ic('product', 15) + ' ' : ''}概览</div>
+      <div id="lsStats" class="section-gap"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">📋 记录列表
+        <span style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <input id="lsQ" class="input" placeholder="🔍 ASIN / 标题 / 品牌 / 父ASIN" style="width:220px">
+          <select id="lsResult" class="input" style="width:142px" title="按上传结果筛选(只有这一种状态数据)">
+            <option value="">全部上传结果</option>
+            <option value="ok">✅ 成功</option>
+            <option value="failed">❌ 失败</option>
+            <option value="none">— 还没有结果</option>
+            <option value="everfailed">历史上失败过</option>
+          </select>
+          <button id="lsReload" class="btn small">刷新</button>
+        </span>
+      </div>
+      <div id="lsList" class="section-gap"></div>
+      <div class="section-gap" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+        <button id="lsCsv" class="btn small">⤓ 导出 CSV</button>
+        <button id="lsLogBtn" class="btn small">🕘 上传记录</button>
+        <button id="lsArchive" class="btn small">🗄 归档到选品库</button>
+        <button id="lsCopy" class="btn small">📋 复制选中 ASIN</button>
+        <button id="lsMoreBtn" class="btn small" title="标记状态/补子体价格/删除 —— 按需求收起来了, 需要时再展开">⋯ 更多操作</button>
+        <span id="lsMore" style="display:none;gap:6px;flex-wrap:wrap;align-items:center">
+          <button id="lsMarkListed" class="btn small">✓ 标记选中为已上架</button>
+          <button id="lsMarkPending" class="btn small">↺ 改回待上架</button>
+          <button id="lsFillPrices" class="btn small">💰 补子体价格</button>
+          <button id="lsDel" class="btn small">🗑 删除选中</button>
+          <button id="lsClear" class="btn small">清空全部</button>
+        </span>
+        <span id="lsSelInfo" class="muted"></span>
+      </div>
+    </div>
+
+    <div class="card" id="lsLogCard" style="display:none">
+      <div class="card-title">🕘 上传记录 —— 每次填表/提交的流水
+        <span style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <select id="lsLogFilter" class="input" style="width:126px">
+            <option value="">全部</option>
+            <option value="failed">只看失败</option>
+            <option value="ok">只看成功</option>
+          </select>
+          <button id="lsLogReload" class="btn small">刷新</button>
+          <button id="lsLogCsv" class="btn small">⤓ 导出流水 CSV</button>
+        </span>
+      </div>
+      <div id="lsLog" class="section-gap"></div>
+      <div id="lsLogInfo" class="muted"></div>
+    </div>`;
+
+  const sel = new Set();
+  let rows = [];
+
+  const badgeOf = (st) => st === 'listed'
+    ? '<span class="badge low">已上架</span>'
+    : st === 'failed' ? '<span class="badge danger">失败</span>' : '<span class="muted">—</span>';   // 旧调用点保留: 现在没有"待上架"这种中间态了
+
+  /* ★ 2026-09-27 状态简化: 记录里只有【上传结果】一种状态数据 —— 成功 / 失败 / 还没有结果。
+   *   "待填 / 待上传 / 已填未传"不再作为状态显示(排不排队由后端按"有没有成功记录"推导)。 */
+  const resOf = (x) => x.uploadResult || null;
+  const resBadge = (res) => res === 'ok'
+    ? '<span class="badge low">成功</span>'
+    : res === 'failed' ? '<span class="badge danger">失败</span>' : '<span class="muted">—</span>';
+  const lastOf = (x) => (x.uploads || [])[0] || null;
+  const upCell = (x) => {
+    const last = lastOf(x), us = x.uploads || [], res = resOf(x);
+    return resBadge(res) +
+      (last ? ' <span class="muted">' + esc(String(last.at || '').slice(5, 16)) + '</span>' : '') +
+      (res === 'failed' && (x.failReason || last.reason) ? ' <span class="muted" title="' + esc(x.failReason || last.reason) + '">ⓘ</span>' : '') +
+      (us.length ? ' <a href="javascript:void(0)" class="ls-up" data-i="' + esc(x._i) + '" title="展开每次尝试的明细">🕘' + us.length + '</a>' : '');
+  };
+  /** 单次尝试的结果只可能是: 成功(真提交过) / 失败 / 未提交(填了没提交, 不算上传结果) */
+  const attemptBadge = (u) => u.ok === false
+    ? '<span class="badge danger">失败</span>'
+    : (u.submitted === true ? '<span class="badge low">成功</span>' : '<span class="badge" title="填了表但没提交 —— 不是上传结果">未提交</span>');
+  /** 展开的"每次尝试"明细(上架记录只做记录 → 这里就是把记录摊开看) */
+  const uploadHistoryHtml = (x) => {
+    const us = x.uploads || [];
+    return '<div style="max-height:240px;overflow:auto"><table style="min-width:880px"><thead><tr>' +
+      '<th>第几次</th><th>时间</th><th>结果</th><th>填表</th><th>失败字段</th><th>原因(ifast 原话)</th></tr></thead><tbody>' +
+      us.map((u) => '<tr>' +
+        '<td>#' + esc(u.attempt || '') + '</td>' +
+        '<td style="white-space:nowrap">' + esc(String(u.at || '')) + '</td>' +
+        '<td>' + attemptBadge(u) + '</td>' +
+        '<td>' + esc(u.fieldsOk != null ? (u.fieldsOk + ' 项成功') : '') + (u.fieldsBad ? (' / <span class="badge danger">' + esc(u.fieldsBad) + ' 项失败</span>') : '') + '</td>' +
+        '<td style="max-width:240px">' + esc((u.badFields || []).join('; ').slice(0, 120)) + '</td>' +
+        '<td style="max-width:420px">' + esc(String(u.reason || '').slice(0, 200)) + '</td>' +
+        '</tr>').join('') + '</tbody></table></div>' +
+      (x.failReason && resOf(x) === 'failed' ? '<div class="muted" style="margin-top:4px">最近一次失败原因: <b style="color:#ff8080">' + esc(x.failReason) + '</b></div>' : '') +
+      '<div class="muted" style="margin-top:4px">共尝试 ' + esc(x.uploadsTotal || us.length) + ' 次' + (x.failCount ? ' · 其中失败 ' + esc(x.failCount) + ' 次' : '') + '</div>';
+  };
+
+  const load = async () => {
+    const q = $('#lsQ').value.trim(), res = $('#lsResult').value;
+    const r = await API('/api/listing/records?limit=500' + (q ? '&q=' + encodeURIComponent(q) : '') + (res ? '&upload=' + encodeURIComponent(res) : ''));
+    rows = r.items || [];
+    const s = r.stats || {}, up = s.uploads || {}, br = s.byResult || {};
+    $('#lsStats').innerHTML = '<div style="display:flex;gap:12px;flex-wrap:wrap">' +
+      [['总数', s.total || 0], ['✅ 成功', br.ok || 0], ['❌ 失败', br.failed || 0], ['— 还没有结果', br.none || 0],
+       ['上传尝试', up.attempts || 0], ['其中失败', up.failed || 0], ['重传过的品', up.retried || 0],
+       ['最近失败', up.lastFailAt ? String(up.lastFailAt).slice(5, 16) : '—'],
+       ['含变体', s.withVariants || 0], ['站点', Object.keys(s.bySite || {}).join('/') || '-']]
+        .map((kv) => '<div class="filter-item" style="min-width:104px"><label>' + kv[0] + '</label>' +
+          '<div style="font-size:19px;font-weight:700">' + esc(kv[1]) + '</div></div>').join('') + '</div>' +
+      ((up.topFailReasons || []).length
+        ? '<div class="muted" style="margin-top:8px">失败原因 Top: ' +
+          up.topFailReasons.map((f) => '<b style="color:#ff8080">' + esc(f.count) + '×</b> ' + esc(f.reason)).join(' · ') + '</div>'
+        : '');
+
+    if (!rows.length) {
+      $('#lsList').innerHTML = '<div class="empty">' + ((q || res) ? '当前筛选没有匹配的上架记录' : '暂无上架记录 —— 请在 Amazon 商品详情页用采集器 v2 点「📥 采集」再「✅ 入库」') + '</div>';
+      $('#lsSelInfo').textContent = '';
+      return;
+    }
+    rows.forEach((x, i) => { x._i = i; });
+    $('#lsList').innerHTML = '<div style="overflow:auto;max-height:520px"><table style="min-width:1340px">' +
+      '<thead><tr><th style="width:30px"><input type="checkbox" id="lsAll"></th>' +
+      '<th>ASIN</th><th>父ASIN</th><th>站点</th><th>品牌</th><th>标题</th><th>价格</th><th>子体</th>' +
+      '<th>月销</th><th>大排名</th><th>小排名</th><th>配送</th><th>上传结果</th><th>次数</th><th>采集时间</th><th></th></tr></thead><tbody>' +
+      rows.map((x, i) => {
+        const p = x.panel || {}, v = x.variant || {}, kids = v.children || [];
+        const cc = v.childCount || kids.length || 0;
+        const us = x.uploads || [];
+        return '<tr data-i="' + i + '">' +
+          '<td><input type="checkbox" class="ls-cb" data-id="' + esc(x.id) + '"></td>' +
+          '<td><b>' + esc(x.asin) + '</b></td>' +
+          '<td>' + esc(x.parentAsin || '—') + '</td>' +
+          '<td>' + esc((x.site || '').toUpperCase()) + '</td>' +
+          '<td>' + esc(x.brand || '') + '</td>' +
+          '<td style="max-width:260px">' + esc(String(x.title || '').slice(0, 60)) + '</td>' +
+          '<td>' + (x.price != null ? esc(x.price) + ' ' + esc(x.currency || '') : '') + '</td>' +
+          '<td>' + (cc ? '<a href="javascript:void(0)" class="ls-exp" data-i="' + i + '">' + cc + ' 个 ' + (v.dims || []).map((d) => esc(d.nameCn || d.name)).join('×') + '</a>' : '—') + '</td>' +
+          '<td>' + (p.sales30d != null ? esc(p.sales30d) : '') + '</td>' +
+          '<td>' + (p.bsrShop != null ? '#' + esc(p.bsrShop) : '') + '</td>' +
+          '<td>' + (p.bsrCat != null ? '#' + esc(p.bsrCat) + (p.bsrCatName ? ' ' + esc(String(p.bsrCatName).slice(0, 16)) : '') : '') + '</td>' +
+          '<td>' + esc(p.fulfill || '') + '</td>' +
+          '<td style="white-space:nowrap">' + upCell(x) + '</td>' +
+          '<td>' + esc(x.uploadsTotal || us.length || 0) + (x.failCount ? ' <span class="badge danger">败' + esc(x.failCount) + '</span>' : '') + '</td>' +
+          '<td style="white-space:nowrap">' + esc(String(x.savedAt || '').slice(5, 16)) + '</td>' +
+          '<td><button class="btn small ls-del" data-id="' + esc(x.id) + '">删</button></td>' +
+          '</tr>' +
+          (us.length ? '<tr class="ls-ups" id="lsUps' + i + '" style="display:none"><td></td><td colspan="15">' + uploadHistoryHtml(x) + '</td></tr>' : '') +
+          '<tr class="ls-kids" id="lsKids' + i + '" style="display:none"><td></td><td colspan="15">' +
+          (kids.length
+            ? '<div style="max-height:260px;overflow:auto"><table style="min-width:720px"><thead><tr><th>子体 ASIN</th>' +
+              (v.dims || []).map((d) => '<th>' + esc(d.nameCn || d.name) + '</th>').join('') +
+              '<th>选中</th><th>价格</th><th>主图</th></tr></thead><tbody>' +
+              kids.map((c) => '<tr><td>' + esc(c.asin) + '</td>' +
+                (v.dims || []).map((d) => '<td>' + esc((c.options || {})[d.nameCn || d.name] || '') + '</td>').join('') +
+                '<td>' + (c.selected ? '✓' : '') + '</td>' +
+                '<td>' + (c.price != null ? esc(c.price) : '<span class="muted">—</span>') + '</td>' +
+                '<td>' + (c.image ? '<a href="' + esc(c.image) + '" target="_blank" rel="noopener"><img src="' + esc(c.image) + '" style="height:34px;border-radius:3px"></a>' : '<span class="muted">—</span>') + '</td>' +
+                '</tr>').join('') + '</tbody></table></div>' +
+              '<div class="muted" style="margin-top:4px">子体价格说明: Amazon 详情页只渲染<b>当前选中</b>子体的价格, 其余拿不到 → 留空(不编造)</div>'
+            : '<span class="muted">该商品无变体子体数据</span>') +
+          '</td></tr>';
+      }).join('') + '</tbody></table></div>';
+
+    $('#lsSelInfo').textContent = '共 ' + rows.length + ' 条';
+    $('#lsAll').addEventListener('change', (e) => {
+      $$('.ls-cb').forEach((cb) => { cb.checked = e.target.checked; if (e.target.checked) sel.add(cb.dataset.id); else sel.delete(cb.dataset.id); });
+      info();
+    });
+    $$('.ls-cb').forEach((cb) => cb.addEventListener('change', () => { if (cb.checked) sel.add(cb.dataset.id); else sel.delete(cb.dataset.id); info(); }));
+    $$('.ls-exp').forEach((a) => a.addEventListener('click', () => {
+      const r = $('#lsKids' + a.dataset.i);
+      if (r) r.style.display = r.style.display === 'none' ? '' : 'none';
+    }));
+    /* 🕘 展开这件商品的每次上传尝试(时间/结果/失败字段/ifast 原话) */
+    $$('.ls-up').forEach((a) => a.addEventListener('click', () => {
+      const r = $('#lsUps' + a.dataset.i);
+      if (r) r.style.display = r.style.display === 'none' ? '' : 'none';
+    }));
+    $$('.ls-del').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('删除这条上架记录? (只删上架记录, 不动商品库)')) return;
+      await API('/api/listing/records/delete', { method: 'POST', body: JSON.stringify({ ids: [b.dataset.id] }) });
+      sel.delete(b.dataset.id); load();
+    }));
+    info();
+  };
+  const info = () => { $('#lsSelInfo').textContent = '共 ' + rows.length + ' 条' + (sel.size ? (' · 已选 ' + sel.size) : ''); };
+
+  const act = async (status) => {
+    if (!sel.size) { alert('请先勾选记录'); return; }
+    await API('/api/listing/records/status', { method: 'POST', body: JSON.stringify({ ids: [...sel], status }) });
+    load();
+  };
+
+  $('#lsReload').addEventListener('click', load);
+  $('#lsQ').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+  $('#lsResult').addEventListener('change', load);
+  /* ★ 2026-09-27 上架器只做记录/显示/导出 —— 动作类按钮默认收起, 需要时展开 */
+  $('#lsMoreBtn').addEventListener('click', () => {
+    const box = $('#lsMore'), on = box.style.display === 'none';
+    box.style.display = on ? 'flex' : 'none';
+    $('#lsMoreBtn').textContent = on ? '⋯ 收起操作' : '⋯ 更多操作';
+  });
+  /* ★ 归档到选品库: 勾了就归档勾选的, 没勾就归档当前列表(含筛选结果) */
+  $('#lsArchive').addEventListener('click', async () => {
+    const picked = sel.size ? rows.filter((x) => sel.has(x.id)) : rows;
+    if (!picked.length) { $('#lsSelInfo').textContent = '✗ 没有可归档的记录'; return; }
+    const today = new Date().toISOString().slice(0, 10);
+    $('#lsSelInfo').textContent = '⏳ 正在归档 ' + picked.length + ' 条…';
+    try {
+      const r = await API('/api/archive/save', { method: 'POST', body: JSON.stringify({
+        source: 'listing', ids: picked.map((x) => x.id),
+        name: today + ' 上架记录 ' + picked.length + ' 个' + (sel.size ? ' (选中)' : ''),
+      }) });
+      if (!r.ok) { $('#lsSelInfo').textContent = '✗ ' + (r.error || '归档失败'); return; }
+      $('#lsSelInfo').innerHTML = '✓ 已归档 ' + r.count + ' 个品到「' + esc(r.name) + '」' +
+        (r.dupCount ? ' · 其中 ' + r.dupCount + ' 个以前归档过' : '') +
+        ' —— 去 <a href="javascript:void(0)" id="lsGoArchive">选品归档</a> 检索/导出';
+      const go = $('#lsGoArchive');
+      if (go) go.addEventListener('click', () => navigate('archive'));
+    } catch (e) { $('#lsSelInfo').textContent = '✗ ' + e.message; }
+  });
+  $('#lsMarkListed').addEventListener('click', () => act('listed'));
+  $('#lsMarkPending').addEventListener('click', () => act('pending'));
+  $('#lsCopy').addEventListener('click', async () => {
+    const ids = sel.size ? rows.filter((x) => sel.has(x.id)).map((x) => x.asin) : rows.map((x) => x.asin);
+    if (!ids.length) { alert('没有可复制的 ASIN'); return; }
+    try { await navigator.clipboard.writeText(ids.join(',')); $('#lsSelInfo').textContent = '✓ 已复制 ' + ids.length + ' 个 ASIN'; }
+    catch (e) { $('#lsSelInfo').textContent = '复制失败: ' + e.message; }
+  });
+  $('#lsCsv').addEventListener('click', async () => {
+    const r = await API('/api/listing/export?format=csv');
+    const blob = new Blob(['\ufeff' + (r.csv || '')], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'listing-records-' + new Date().toISOString().slice(0, 10) + '.csv';
+    a.click();
+  });
+  $('#lsDel').addEventListener('click', async () => {
+    if (!sel.size) { alert('请先勾选记录'); return; }
+    if (!confirm('删除选中的 ' + sel.size + ' 条上架记录? (只删上架记录, 不动商品库)')) return;
+    await API('/api/listing/records/delete', { method: 'POST', body: JSON.stringify({ ids: [...sel] }) });
+    sel.clear(); load();
+  });
+  $('#lsClear').addEventListener('click', async () => {
+    if (!confirm('清空【全部】上架记录? 此操作只影响上架记录(独立存储), 商品库不受影响。')) return;
+    await API('/api/listing/records/clear', { method: 'POST', body: '{}' });
+    sel.clear(); load();
+  });
+
+  // ★ 补子体价格: Amazon 详情页只渲染选中子体的价格, 其余只能逐个开子体页读 (显式按需动作)
+  $('#lsFillPrices').addEventListener('click', async () => {
+    const picked = sel.size ? rows.filter((x) => sel.has(x.id)) : rows;
+    if (!picked.length) { alert('没有可补价的记录'); return; }
+    const ids = picked.map((x) => x.id);
+    const pending = picked.reduce((n, x) => n + (((x.variant && x.variant.children) || []).filter((c) => c.price == null).length), 0);
+    if (!pending) { alert('这些记录的子体都已有价格, 无需补'); return; }
+    const mins = Math.max(1, Math.ceil(pending * 7 / 60));
+    if (!confirm('将逐个打开 ' + pending + ' 个子体商品页读价 (约 ' + mins + ' 分钟, 会占用采集用的 Edge 标签页, 期间请不要手动操作那个窗口)。\n\n继续?')) return;
+    $('#lsSelInfo').textContent = '⏳ 正在补价 (' + pending + ' 个子体)…';
+    let r;
+    try { r = await API('/api/listing/fill-child-prices', { method: 'POST', body: JSON.stringify({ ids }) }); }
+    catch (e) { $('#lsSelInfo').textContent = '✗ ' + e.message; return; }
+    if (r && r.busy) { $('#lsSelInfo').textContent = '✗ ' + r.error; return; }
+    if (r && r.ok && r.total === 0) { $('#lsSelInfo').textContent = '✓ ' + (r.msg || '无需补'); return; }
+    const t0 = Date.now();
+    const timer = setInterval(async () => {
+      try {
+        const pg = await API('/api/collect/progress');
+        const secs = Math.round((Date.now() - t0) / 1000);
+        if (pg && pg.running) $('#lsSelInfo').textContent = '⏳ ' + (pg.step || '补价中') + ' · ' + secs + 's';
+        else { clearInterval(timer); $('#lsSelInfo').textContent = '✓ 补价完成, 正在刷新…'; load(); }
+      } catch (e) { /* 忽略单次轮询失败 */ }
+    }, 3000);
+  });
+
+  await load();
+
+  /* ★ 2026-09-27 「上传记录」流水 —— 上架记录只做记录, 这一块就是把每次上传摊开:
+   *   时间 / 哪件商品 / 第几次 / 结果 / 填了几项 / 失败字段 / ifast 的原话。
+   *   用户要的"记录商品的上传数据, 比如上传失败"就是这里。 */
+  let logRows = [];
+  const loadLog = async () => {
+    const f = $('#lsLogFilter').value;
+    $('#lsLogInfo').textContent = '⏳ 读取中…';
+    let r;
+    try { r = await API('/api/listing/uploads?limit=300' + (f ? '&result=' + encodeURIComponent(f) : '')); }
+    catch (e) { $('#lsLogInfo').textContent = '✗ ' + e.message; return; }
+    logRows = r.items || [];
+    const st = (r.stats && r.stats.uploads) || {};
+    $('#lsLog').innerHTML = logRows.length
+      ? '<div style="overflow:auto;max-height:420px"><table style="min-width:1080px"><thead><tr>' +
+        '<th>时间</th><th>商品</th><th>站点</th><th>第几次</th><th>结果</th><th>填表</th><th>失败字段</th><th>原因(ifast 原话)</th><th>当前状态</th></tr></thead><tbody>' +
+        logRows.map((u) => '<tr>' +
+          '<td style="white-space:nowrap">' + esc(String(u.at || '')) + '</td>' +
+          '<td><b>' + esc(u.asin) + '</b><div class="muted" style="max-width:220px">' + esc(String(u.title || '').slice(0, 34)) + '</div></td>' +
+          '<td>' + esc(String(u.site || '').toUpperCase()) + '</td>' +
+          '<td>#' + esc(u.attempt || '') + '</td>' +
+          '<td>' + attemptBadge(u) + '</td>' +
+          '<td>' + esc(u.fieldsOk != null ? u.fieldsOk : '') + (u.fieldsBad ? ' / <span class="badge danger">' + esc(u.fieldsBad) + ' 失败</span>' : '') + '</td>' +
+          '<td style="max-width:200px">' + esc((u.badFields || []).join('; ').slice(0, 100)) + '</td>' +
+          '<td style="max-width:360px">' + esc(String(u.reason || '').slice(0, 180)) + '</td>' +
+          '<td>' + resBadge(u.nowResult != null ? u.nowResult : null) + (u.failCount ? ' <span class="muted">败' + esc(u.failCount) + '</span>' : '') + '</td>' +
+          '</tr>').join('') + '</tbody></table></div>'
+      : '<div class="empty">还没有上传记录 —— 采集器点「上传」后, ifast 那边的每次填表/提交结果都会记到这里</div>';
+    $('#lsLogInfo').textContent = '共 ' + (r.total || 0) + ' 条流水' +
+      ' · 尝试 ' + (st.attempts || 0) + ' 次, 成功 ' + (st.ok || 0) + ', 失败 ' + (st.failed || 0) +
+      ' · 有 ' + (st.neverTried || 0) + ' 件还没有上传结果' +
+      (st.lastFailAt ? ' · 最近失败 ' + String(st.lastFailAt).slice(5, 16) : '');
+  };
+  $('#lsLogBtn').addEventListener('click', () => {
+    const card = $('#lsLogCard'), on = card.style.display === 'none';
+    card.style.display = on ? '' : 'none';
+    $('#lsLogBtn').textContent = on ? '🕘 收起上传记录' : '🕘 上传记录';
+    if (on) loadLog();
+  });
+  $('#lsLogFilter').addEventListener('change', loadLog);
+  $('#lsLogReload').addEventListener('click', loadLog);
+  $('#lsLogCsv').addEventListener('click', async () => {
+    if (!logRows.length) { await loadLog(); }
+    if (!logRows.length) { $('#lsLogInfo').textContent = '✗ 没有可导出的上传记录'; return; }
+    const head = ['时间', 'ASIN', '站点', '标题', '第几次', '结果', '填表成功项', '填表失败项', '失败字段', '原因', '当前状态', '累计失败次数'];
+    const q = (v) => { const s = v == null ? '' : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s };
+    const csv = [head.join(',')].concat(logRows.map((u) => [u.at, u.asin, u.site, u.title, u.attempt,
+      u.ok === false ? '失败' : (u.submitted === true ? '成功' : '未提交'),
+      u.fieldsOk, u.fieldsBad, (u.badFields || []).join('; '), u.reason,
+      u.nowStatus, u.failCount].map(q).join(','))).join('\n');
+    const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = '上传记录-' + new Date().toISOString().slice(0, 10) + '.csv';
+    a.click();
+    $('#lsLogInfo').textContent = '✓ 已导出 ' + logRows.length + ' 条上传记录';
+  });
+}
+
+
+/* ===== ★ 选品归档 (2026-09-27) =====
+ * 用户原话: 「上架器只负责记录和显示信息，导出信息等，加上一个导出当前所有商品信息…存起来，
+ *   因为这些都是我们最终选出来的品，具有模板或者借鉴意义，方便后续根据这些品来找相应的品」。
+ * 本页只做三件事: 归档(存快照) / 检索 / 导出文件 —— 不采集、不上架、不改商品库。
+ */
+async function renderArchive() {
+  const content = $('#content');
+  const d = new Date(), p2 = (n) => String(n).padStart(2, '0');
+  const dstr = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate());
+  content.innerHTML = `
+    <div class="notice">📦 <b>选品归档</b> —— 把<b>最终选出来的品</b>(连同当时的承受价 / 利润率 / 排名 / 月销 / 变体)存成<b>快照</b>。
+      <b>商品库(10万+)是"采过的池子", 上架记录是"这轮要上的清单", 归档库是"我们最终看中的品"</b> ——
+      存下来的这份不受源数据增删影响, 以后照它找相似的品。可导出 CSV(Excel 直接打开) / JSON。</div>
+
+    <div class="card">
+      <div class="card-title">${ic ? ic('file', 15) + ' ' : ''}概览</div>
+      <div id="arStats" class="section-gap"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">📊 分布
+        <span style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <select id="arStatSite" class="input" style="width:118px" title="按站点看分布 —— 价格与承受价都是【站点本币】, 混站点没有可比性">
+            <option value="">全部站点</option>
+            <option value="uk">英国 uk</option><option value="de">德国 de</option><option value="au">澳洲 au</option>
+            <option value="us">美国 us</option><option value="fr">法国 fr</option><option value="it">意大利 it</option>
+            <option value="es">西班牙 es</option><option value="ca">加拿大 ca</option>
+          </select>
+          <span class="muted" id="arStatInfo"></span>
+        </span>
+      </div>
+      <div id="arDist" class="section-gap">加载中…</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🗄 归档当前商品</div>
+      <div class="section-gap" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+        <div class="filter-item"><label>批次名</label><input id="arName" class="input" style="width:240px" value="${esc(dstr)} 选品归档"></div>
+        <div class="filter-item"><label>来源</label>
+          <select id="arSource" class="input" style="width:230px">
+            <option value="listing">上架记录 (最终要上的, 带承受价)</option>
+            <option value="products">商品库 (全池子)</option>
+          </select></div>
+        <div class="filter-item"><label>站点</label>
+          <select id="arSite" class="input" style="width:126px">
+            <option value="">全部站点</option>
+            <option value="uk">英国 uk</option><option value="de">德国 de</option><option value="au">澳洲 au</option>
+            <option value="us">美国 us</option><option value="fr">法国 fr</option><option value="it">意大利 it</option>
+            <option value="es">西班牙 es</option><option value="ca">加拿大 ca</option>
+          </select></div>
+        <div class="filter-item" id="arSavedWrap" style="display:none"><label>只要收藏的</label>
+          <select id="arSaved" class="input" style="width:96px"><option value="">否</option><option value="1">是</option></select></div>
+        <div class="filter-item" id="arLimitWrap" style="display:none"><label>最多条数</label>
+          <input id="arLimit" class="input" type="number" style="width:104px" value="3000" min="1" max="20000"></div>
+        <button id="arSave" class="btn">🗄 现在归档</button>
+        <span id="arMsg" class="muted"></span>
+      </div>
+      <div class="muted" id="arHint" style="margin-top:6px"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">📚 归档批次</div>
+      <div id="arBatches" class="section-gap"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🔍 归档商品
+        <span style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <input id="arQ" class="input" placeholder="🔍 ASIN / 标题 / 品牌 / 类目" style="width:210px">
+          <select id="arDedup" class="input" style="width:158px">
+            <option value="1">去重 (按 ASIN@站点)</option>
+            <option value="0">含重复 (全部批次)</option>
+          </select>
+          <button id="arCsv" class="btn small">⤓ 导出 CSV</button>
+          <button id="arJson" class="btn small">⤓ 导出 JSON</button>
+          <button id="arReload" class="btn small">刷新</button>
+        </span>
+      </div>
+      <div class="section-gap" id="arFilters" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div class="filter-item"><label>类目</label><select id="arCat1" class="input" style="width:150px"><option value="">全部类目</option></select></div>
+        <div class="filter-item"><label>利润 ≥</label><input id="arMarginMin" class="input" type="number" step="0.05" style="width:80px" placeholder="如 0.3"></div>
+        <div class="filter-item"><label>月销 ≥</label><input id="arSalesMin" class="input" type="number" style="width:80px" placeholder="如 300"></div>
+        <div class="filter-item"><label>大排名 ≤</label><input id="arRankMax" class="input" type="number" style="width:92px" placeholder="如 50000"></div>
+        <div class="filter-item"><label>价格区间</label><span style="display:flex;gap:4px"><input id="arPriceMin" class="input" type="number" step="0.01" style="width:72px" placeholder="min"><input id="arPriceMax" class="input" type="number" step="0.01" style="width:72px" placeholder="max"></span></div>
+        <div class="filter-item"><label>标签</label><select id="arTag" class="input" style="width:112px">
+          <option value="">全部标签</option><option value="爆款">爆款</option><option value="试销">试销</option><option value="放弃">放弃</option><option value="季节品">季节品</option>
+        </select></div>
+        <button id="arApply" class="btn small">应用筛选</button>
+        <button id="arResetFilter" class="btn small">重置</button>
+        <span class="muted" id="arFilterInfo"></span>
+      </div>
+      <div id="arList" class="section-gap"></div>
+      <div class="section-gap" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <span class="muted">自动归档:</span>
+        <label style="display:inline-flex;gap:5px;align-items:center;cursor:pointer" title="每天到点自动把「当前上架记录」快照一批 —— 与上次完全一样时会跳过, 不产生空批次">
+          <input type="checkbox" id="arAutoOn"> 每天自动存一次</label>
+        <span class="muted">时间</span>
+        <select id="arAutoHour" class="input" style="width:86px"></select>
+        <button id="arAutoRun" class="btn small" title="不等定时, 现在就快照一批(内容没变会自动跳过)">立即归档一次</button>
+        <span class="muted" id="arAutoInfo"></span>
+      </div>
+      <div id="arFilterInfo" class="section-gap muted"></div>
+      <div class="section-gap muted" id="arSelInfo"></div>
+    </div>`;
+
+  let curBatch = '';               // 空=全部批次
+
+  /** 查询串组装: 列表/统计/导出三处共用同一份筛选(口径必须一致, 否则"看到的"和"导出的"不一样) */
+  const Q = (o) => Object.keys(o).filter((k) => o[k] !== '' && o[k] != null).map((k) => k + '=' + encodeURIComponent(String(o[k]))).join('&');
+  const fv = (id) => { const el = $('#' + id); return el && String(el.value).trim() ? String(el.value).trim() : '' };
+  const filterQs = () => Q({
+    dedup: $('#arDedup').value, q: fv('arQ'), site: fv('arStatSite'), cat1: fv('arCat1'), tag: fv('arTag'),
+    marginMin: fv('arMarginMin'), salesMin: fv('arSalesMin'), rankMax: fv('arRankMax'),
+    priceMin: fv('arPriceMin'), priceMax: fv('arPriceMax'), batchId: curBatch,
+  });
+  const filterText = () => {
+    const parts = [];
+    const add = (label, v) => { if (v) parts.push(label + '=' + v) };
+    add('类目', fv('arCat1')); add('利润≥', fv('arMarginMin')); add('月销≥', fv('arSalesMin'));
+    add('排名≤', fv('arRankMax'));
+    if (fv('arPriceMin') || fv('arPriceMax')) parts.push('价格 ' + (fv('arPriceMin') || '0') + '~' + (fv('arPriceMax') || '∞'));
+    add('标签', fv('arTag')); add('站点', String(fv('arStatSite')).toUpperCase()); add('搜索', fv('arQ'));
+    return parts.length ? '当前筛选: ' + parts.join(' · ') : '未加筛选';
+  };
+
+  const dl = (name, text, mime) => {
+    const blob = new Blob(['\ufeff' + text], { type: mime || 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  };
+  const pct = (it) => it.marginPct != null ? (it.marginPct * 100).toFixed(1) + '%'
+    : (it.bearMargin != null ? '<span class="muted">设定 ' + (it.bearMargin * 100).toFixed(0) + '%</span>' : '<span class="muted">—</span>');
+
+  const loadHead = async () => {
+    const r = await API('/api/archive/list');
+    const s = r.stats || {};
+    $('#arStats').innerHTML = '<div style="display:flex;gap:12px;flex-wrap:wrap">' +
+      [['批次数', s.batches || 0], ['归档条目', s.items || 0], ['去重后唯一品', s.unique || 0],
+       ['最近归档', s.lastArchivedAt ? String(s.lastArchivedAt).slice(5, 16) : '—'],
+       ['站点', Object.keys(s.bySite || {}).join('/') || '—']]
+        .map((kv) => '<div class="filter-item" style="min-width:118px"><label>' + kv[0] + '</label>' +
+          '<div style="font-size:19px;font-weight:700">' + esc(kv[1]) + '</div></div>').join('') + '</div>';
+
+    const bs = r.batches || [];
+    $('#arBatches').innerHTML = bs.length
+      ? '<div style="overflow:auto;max-height:320px"><table style="min-width:940px"><thead><tr>' +
+        '<th>归档时间</th><th>批次名</th><th>来源</th><th>条数</th><th>其中重复</th><th>站点</th><th>操作</th></tr></thead><tbody>' +
+        bs.map((b) => '<tr><td style="white-space:nowrap">' + esc(String(b.createdAt || '').slice(0, 16)) + '</td>' +
+          '<td>' + esc(b.name) + '</td>' +
+          '<td>' + esc(b.source === 'products' ? '商品库' : '上架记录') + '</td>' +
+          '<td><b>' + esc(b.count) + '</b></td>' +
+          '<td>' + (b.dupCount ? esc(b.dupCount) : '<span class="muted">0</span>') + '</td>' +
+          '<td>' + esc(Object.keys(b.bySite || {}).join('/')) + '</td>' +
+          '<td style="white-space:nowrap">' +
+            '<button class="btn small ar-view" data-id="' + esc(b.batchId) + '">只看这批</button> ' +
+            '<button class="btn small ar-exp" data-id="' + esc(b.batchId) + '" data-name="' + esc(b.name) + '">导这批</button> ' +
+            '<button class="btn small ar-del" data-id="' + esc(b.batchId) + '">删</button>' +
+          '</td></tr>').join('') + '</tbody></table></div>'
+      : '<div class="empty">还没有归档 —— 上面点「🗄 现在归档」把当前选出来的品存一份</div>';
+
+    $$('.ar-view').forEach((btn) => btn.addEventListener('click', () => {
+      curBatch = curBatch === btn.dataset.id ? '' : btn.dataset.id;
+      $('#arSelInfo').textContent = curBatch ? '只看批次 ' + curBatch : '';
+      loadItems();
+    }));
+    $$('.ar-exp').forEach((btn) => btn.addEventListener('click', async () => {
+      const rr = await API('/api/archive/export?format=csv&dedup=0&batchId=' + encodeURIComponent(btn.dataset.id));
+      dl((btn.dataset.name || '选品归档').replace(/[\\/:*?"<>|]/g, '_') + '.csv', rr.csv || '', 'text/csv;charset=utf-8');
+    }));
+    $$('.ar-del').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!confirm('删除这个归档批次? (只删归档, 不动商品库和上架记录)')) return;
+      await API('/api/archive/batch/delete', { method: 'POST', body: JSON.stringify({ batchId: btn.dataset.id }) });
+      if (curBatch === btn.dataset.id) curBatch = '';
+      loadHead(); loadItems(); loadStats();
+    }));
+  };
+
+  /* ===== ★ 分布可视化 (2026-09-27) =====
+   * 数据来自 /api/archive/stats(与列表用同一套筛选口径), 图用纯 CSS 条形 + 一个 SVG 散点,
+   * 不引三方图表库(离线可用, 也不给这个页面再加依赖)。
+   * 用途: 一眼看出「哪类品最多 / 哪个价格带利润高 / 哪些品又高销又高利」。 */
+  const barsHtml = (title, pairs, opts) => {
+    const arr = (pairs || []).filter((p) => p && p[0]);
+    if (!arr.length) return '';
+    const max = Math.max.apply(null, arr.map((p) => Number(p[1]) || 0)) || 1;
+    const o = opts || {};
+    return '<div style="min-width:240px;flex:1 1 280px">' +
+      '<div class="muted" style="margin-bottom:4px">' + esc(title) + '</div>' +
+      arr.slice(0, o.top || 8).map((p) => {
+        const n = Number(p[1]) || 0, w = Math.max(2, Math.round(n / max * 100));
+        return '<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">' +
+          '<span style="width:' + (o.labelW || 96) + 'px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(p[0]) + '">' + esc(String(p[0])) + '</span>' +
+          '<span style="flex:1;background:rgba(255,255,255,.07);border-radius:3px;height:13px"><span style="display:block;width:' + w + '%;height:13px;border-radius:3px;background:' + (o.color || '#4f8cff') + '"></span></span>' +
+          '<span style="width:38px;text-align:right" class="muted">' + n + '</span></div>';
+      }).join('') + '</div>';
+  };
+  const bucketPairs = (obj) => Object.keys(obj || {}).filter((k) => obj[k] > 0).map((k) => [k, obj[k]]);
+  /** 四象限散点: 横=月销(log)、纵=利润率; 颜色按利润率(绿≥目标/琥珀/红亏); 点大小=变体数 */
+  const scatterSvg = (pts, targetMargin) => {
+    if (!pts || !pts.length) return '<div class="muted">没有同时带「月销 + 利润率」的商品, 画不了散点(先去归档带上这两项的数据)</div>';
+    const W = 620, H = 260, L = 46, B = 28, T = 12, R = 12;
+    const xs = pts.map((p) => Number(p.sales30d) || 0);
+    const ys = pts.map((p) => Number(p.marginPct) || 0);
+    const xMax = Math.max.apply(null, xs) || 1, xMin = 0;
+    const yMax = Math.max(0.5, Math.max.apply(null, ys.map((y) => y + 0.05))), yMin = Math.min(0, Math.min.apply(null, ys) - 0.05);
+    const lx = (v) => L + (Math.log10(1 + Math.max(0, v - xMin)) / Math.log10(1 + Math.max(1, xMax - xMin))) * (W - L - R);
+    const ly = (v) => T + (1 - (v - yMin) / (yMax - yMin || 1)) * (H - T - B);
+    const medSales = xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)] || 0;
+    const col = (m) => (m >= (targetMargin || 0.3) ? '#5fd08a' : (m >= 0 ? '#f0b253' : '#f28b8b'));
+    const gridY = [yMin, 0, (yMin + yMax) / 2, yMax].filter((v) => v >= yMin - 1e-9 && v <= yMax + 1e-9);
+    const tgtY = (targetMargin != null && targetMargin > yMin && targetMargin < yMax) ? ly(targetMargin) : null;
+    return '<div style="overflow-x:auto"><svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;max-width:760px;height:260px">' +
+      gridY.map((v) => '<line x1="' + L + '" y1="' + ly(v).toFixed(1) + '" x2="' + (W - R) + '" y2="' + ly(v).toFixed(1) + '" stroke="rgba(255,255,255,.10)"/>' +
+        '<text x="4" y="' + (ly(v) + 4).toFixed(1) + '" fill="#8b93a3" font-size="10">' + Math.round(v * 100) + '%</text>').join('') +
+      (tgtY != null ? '<line x1="' + L + '" y1="' + tgtY.toFixed(1) + '" x2="' + (W - R) + '" y2="' + tgtY.toFixed(1) + '" stroke="rgba(95,208,138,.5)" stroke-dasharray="4 3"/>' +
+        '<text x="' + (W - R - 92) + '" y="' + (tgtY - 4).toFixed(1) + '" fill="#5fd08a" font-size="10">目标利润率 ' + Math.round(targetMargin * 100) + '%</text>' : '') +
+      '<line x1="' + lx(medSales).toFixed(1) + '" y1="' + T + '" x2="' + lx(medSales).toFixed(1) + '" y2="' + (H - B) + '" stroke="rgba(255,255,255,.10)" stroke-dasharray="3 3"/>' +
+      pts.map((p) => {
+        const cx = lx(Number(p.sales30d) || 0), cy = ly(Number(p.marginPct) || 0);
+        const rr = 2.6 + Math.min(5, (Number(p.variantCount) || 0) / 2);
+        return '<circle cx="' + cx.toFixed(1) + '" cy="' + cy.toFixed(1) + '" r="' + rr.toFixed(1) + '" fill="' + col(Number(p.marginPct) || 0) + '" fill-opacity=".75" stroke="rgba(0,0,0,.35)">' +
+          '<title>' + esc(p.asin + '@' + String(p.site || '').toUpperCase() + ' · 月销 ' + (p.sales30d || 0) + ' · 利润率 ' + Math.round((p.marginPct || 0) * 100) + '%' +
+            (p.bearPrice != null ? ' · 承受价 ' + p.bearPrice + ' ' + (p.currency || '') : '') + ' · 变体 ' + (p.variantCount || 0) +
+            (p.cat1 ? ' · ' + p.cat1 : '') + (p.brand ? ' · ' + p.brand : '')) + '</title></circle>';
+      }).join('') +
+      '<text x="' + ((L + W - R) / 2) + '" y="' + (H - 6) + '" fill="#8b93a3" font-size="10" text-anchor="middle">月销 (对数轴) → 越靠右越好卖</text>' +
+      '<text x="4" y="' + (T + 8) + '" fill="#8b93a3" font-size="10">利润率 ↑</text>' +
+      '<text x="' + (lx(medSales) + 4).toFixed(1) + '" y="' + (T + 10) + '" fill="#6f7684" font-size="9">中位月销</text>' +
+    '</svg></div>' +
+    '<div class="muted" style="margin-top:4px">绿=达标利润率 · 琥珀=有利润但低于目标 · 红=亏 · 点越大变体越多（悬停看 ASIN）</div>';
+  };
+  const loadStats = async () => {
+    let r;
+    try {
+      r = await API('/api/archive/stats?' + filterQs());
+    } catch (e) { $('#arDist').innerHTML = '<div class="muted">✗ ' + esc(e.message) + '</div>'; return }
+    /* ★ 类目下拉用分布里的真实类目填充(而不是写死几个), 并保住当前选择 */
+    const sel = $('#arCat1');
+    if (sel) {
+      const cur = sel.value;
+      const cats = (r.byCategory1 || []).map((p) => p[0]).filter(Boolean);
+      const have = $$('#arCat1 option').map((o) => o.value).filter(Boolean);
+      if (cats.join('|') !== have.join('|')) {
+        sel.innerHTML = '<option value="">全部类目</option>' + cats.map((c) => '<option value="' + esc(c) + '">' + esc(c) + '</option>').join('');
+        if (cats.indexOf(cur) >= 0) sel.value = cur;
+      }
+    }
+    const num = (v) => (v == null ? '—' : v);
+    const catRows = (r.byCategoryDetail || []).map((c) => '<tr><td>' + esc(c.cat) + '</td><td>' + esc(c.n) + '</td>' +
+      '<td>' + (c.marginAvg != null ? (Math.round(c.marginAvg * 1000) / 10) + '%' : '—') + '</td>' +
+      '<td>' + num(c.salesAvg) + '</td><td>' + num(c.bearAvg) + '</td></tr>').join('');
+    $('#arDist').innerHTML =
+      '<div style="display:flex;gap:16px;flex-wrap:wrap">' +
+        barsHtml('一级类目 (哪个类最多)', r.byCategory1, { color: '#4f8cff' }) +
+        barsHtml('品牌 Top', r.byBrand, { color: '#8a6dff' }) +
+        barsHtml('站点', r.bySite, { color: '#5fd08a', labelW: 70 }) +
+        barsHtml('配送方式', r.byFulfill, { color: '#e0b25c', labelW: 70 }) +
+      '</div>' +
+      '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:10px">' +
+        barsHtml('售价带 (站点本币)', bucketPairs(r.priceBuckets), { color: '#4f8cff', labelW: 70 }) +
+        barsHtml('利润率', bucketPairs(r.marginBuckets), { color: '#5fd08a', labelW: 70 }) +
+        barsHtml('月销', bucketPairs(r.salesBuckets), { color: '#e0b25c', labelW: 70 }) +
+        barsHtml('大排名', bucketPairs(r.rankBuckets), { color: '#f28b8b', labelW: 70 }) +
+        barsHtml('变体数', bucketPairs(r.variantBuckets), { color: '#8ab4ff', labelW: 70 }) +
+      '</div>' +
+      '<div style="margin-top:14px"><div class="muted" style="margin-bottom:4px">月销 × 利润率（找又高销又高利的品）</div>' + scatterSvg(r.scatter, 0.3) + '</div>' +
+      (catRows ? '<div style="margin-top:12px"><div class="muted" style="margin-bottom:4px">类目明细：一眼看哪类「又赚又好卖」</div>' +
+        '<div style="overflow:auto;max-height:260px"><table style="min-width:520px"><thead><tr>' +
+        '<th>一级类目</th><th>数量</th><th>平均利润率</th><th>平均月销</th><th>平均承受价</th></tr></thead><tbody>' + catRows + '</tbody></table></div></div>' : '') +
+      ((r.batchSeries || []).length ? '<div style="margin-top:12px"><div class="muted" style="margin-bottom:4px">批次趋势（每批存了多少 / 其中重复）</div>' +
+        barsHtml('', r.batchSeries.map((b) => [String(b.createdAt || '').slice(5, 16) + ' ' + String(b.name).slice(0, 14), b.count]), { color: '#4f8cff', labelW: 150, top: 12 }) + '</div>' : '');
+    $('#arStatInfo').textContent = '命中 ' + r.total + ' 条' + (r.query && r.query.dedup ? ' (去重后)' : '') +
+      ' · 数据源与左侧列表同一筛选口径';
+  };
+
+  const loadItems = async () => {
+    const r = await API('/api/archive/items?limit=300&' + filterQs());
+    const items = r.items || [];
+    $('#arSelInfo').textContent = '命中 ' + r.total + ' 条' + (r.total > items.length ? ' (只显示前 ' + items.length + ' 条, 导出是全部)' : '') +
+      (curBatch ? ' · 只看批次 ' + curBatch : '') + (curBatch ? ' —— 再点一次「只看这批」可取消' : '');
+    if (!items.length) { $('#arList').innerHTML = '<div class="empty">没有匹配的归档商品</div>'; return; }
+    $('#arList').innerHTML = '<div style="overflow:auto;max-height:560px"><table style="min-width:1420px"><thead><tr>' +
+      '<th>站点</th><th>ASIN</th><th>品牌</th><th>标题</th><th>售价</th><th>承受价</th><th>利润率</th>' +
+      '<th>月销</th><th>大排名</th><th>变体</th><th>标签</th><th>状态</th><th>归档时间</th><th>链接</th></tr></thead><tbody>' +
+      items.map((it) => '<tr>' +
+        '<td>' + esc(String(it.site || '').toUpperCase()) + '</td>' +
+        '<td><b>' + esc(it.asin) + '</b>' + (it.dup ? ' <span class="badge medium" title="以前也归档过' + esc(it.firstArchivedAt || '') + '">重</span>' : '') + '</td>' +
+        '<td>' + esc(it.brand || '') + '</td>' +
+        '<td style="max-width:280px">' + esc(String(it.title || '').slice(0, 62)) + '</td>' +
+        '<td>' + (it.price != null ? esc(fmtMoney(it.price, it.currency)) : '') + '</td>' +
+        '<td>' + (it.bearPrice != null ? '<b>' + esc(fmtMoney(it.bearPrice, it.currency)) + '</b>' : '<span class="muted">—</span>') + '</td>' +
+        '<td>' + pct(it) + '</td>' +
+        '<td>' + (it.sales30d != null ? esc(it.sales30d) : '') + '</td>' +
+        '<td>' + (it.bsrShop != null ? '#' + esc(it.bsrShop) : '') + '</td>' +
+        '<td>' + (it.variantCount ? esc(it.variantCount) + ((it.variantDims || []).length ? ' <span class="muted">' + esc(it.variantDims.join('×')) + '</span>' : '') : '—') + '</td>' +
+        /* ★ 2026-09-27 行内标签: 4 个可点的小胶囊, 点一下即打上/取消(不用弹窗, 直接用)。
+         *   标签按 asin@site 存在服务端, 重新归档不会丢。 */
+        '<td style="white-space:nowrap">' + ['爆款', '试销', '放弃', '季节品'].map((tg) => {
+          const on = (it.tags || []).indexOf(tg) >= 0;
+          return '<span class="ar-tag" data-key="' + esc(it.key || (it.asin + '@' + it.site)) + '" data-tag="' + esc(tg) + '" data-on="' + (on ? '1' : '0') + '" ' +
+            'title="' + (on ? '点一下取消「' + tg + '」' : '点一下标记为「' + tg + '」') + '" ' +
+            'style="cursor:pointer;font-size:11px;padding:0 5px;border-radius:9px;margin-right:3px;border:1px solid ' + (on ? '#4f8cff' : 'rgba(255,255,255,.18)') +
+            ';background:' + (on ? 'rgba(79,140,255,.22)' : 'transparent') + ';color:' + (on ? '#cfe0ff' : '#8b93a3') + '">' + esc(tg) + '</span>';
+        }).join('') + '</td>' +
+        '<td>' + esc(it.status === 'listed' ? '已上架' : it.status === 'saved' ? '收藏' : it.status === 'pool' ? '池子' : it.status === 'failed' ? '失败' : '待上架') + '</td>' +
+        '<td style="white-space:nowrap">' + esc(String(it.archivedAt || '').slice(5, 16)) + '</td>' +
+        '<td>' + (it.url ? '<a href="' + esc(it.url) + '" target="_blank" rel="noopener">打开</a>' : '') + '</td>' +
+        '</tr>').join('') + '</tbody></table></div>';
+    /* 行内标签: 点胶囊即打上/取消(直接落库, 然后刷新列表与分布) */
+    $$('#arList .ar-tag').forEach((el) => el.addEventListener('click', async () => {
+      const key = el.dataset.key, tg = el.dataset.tag, on = el.dataset.on !== '1';
+      el.style.opacity = '.45';
+      try {
+        await API('/api/archive/tag', { method: 'POST', body: JSON.stringify({ keys: [key], tag: tg, on: on }) });
+        $('#arFilterInfo').textContent = '✓ ' + (on ? '已标记' : '已取消') + '「' + tg + '」 ' + key;
+        loadItems(); loadStats();
+      } catch (e) { el.style.opacity = ''; $('#arFilterInfo').textContent = '✗ ' + e.message }
+    }));
+    $('#arFilterInfo').textContent = filterText();
+  };
+
+  $('#arSource').addEventListener('change', () => {
+    const isP = $('#arSource').value === 'products';
+    $('#arSavedWrap').style.display = isP ? '' : 'none';
+    $('#arLimitWrap').style.display = isP ? '' : 'none';
+    $('#arHint').textContent = isP
+      ? '⚠ 商品库有 10 万+ 条 —— 直接归档会很大(也慢)。建议先用「站点」收窄, 或勾「只要收藏的」(你手工收藏过的那些), 最多条数默认 3000。'
+      : '上架记录里的品都带承受价/利润率 —— 这是"最终选出来的品"最完整的形态, 建议默认用它。';
+  });
+  $('#arSource').dispatchEvent(new Event('change'));
+
+  $('#arSave').addEventListener('click', async () => {
+    const source = $('#arSource').value;
+    $('#arMsg').textContent = '⏳ 正在归档…';
+    try {
+      const r = await API('/api/archive/save', { method: 'POST', body: JSON.stringify({
+        source, name: $('#arName').value.trim(), site: $('#arSite').value,
+        onlySaved: $('#arSaved').value === '1',
+        limit: parseInt($('#arLimit').value, 10) || undefined,
+      }) });
+      if (!r.ok) { $('#arMsg').textContent = '✗ ' + (r.error || '归档失败'); return; }
+      $('#arMsg').innerHTML = '✓ 已归档 <b>' + r.count + '</b> 个品到「' + esc(r.name) + '」' +
+        (r.dupCount ? ' · 其中 ' + r.dupCount + ' 个以前归档过' : '') +
+        (r.overflow ? ' · 另有 ' + r.overflow + ' 个超出上限未存' : '');
+      loadHead(); loadItems(); loadStats();
+    } catch (e) { $('#arMsg').textContent = '✗ ' + e.message; }
+  });
+
+  $('#arCsv').addEventListener('click', async () => {
+    const r = await API('/api/archive/export?format=csv&' + filterQs());
+    if (!r.total) { alert('归档库还是空的, 先归档再导出'); return; }
+    dl('选品归档-' + dstr + '.csv', r.csv || '', 'text/csv;charset=utf-8');
+    $('#arSelInfo').textContent = '✓ 已导出 ' + r.total + ' 条到 选品归档-' + dstr + '.csv';
+  });
+  $('#arJson').addEventListener('click', async () => {
+    const r = await API('/api/archive/export?format=json&' + filterQs());
+    if (!r.total) { alert('归档库还是空的, 先归档再导出'); return; }
+    dl('选品归档-' + dstr + '.json', JSON.stringify({ exportedAt: new Date().toISOString(), total: r.total, items: r.items }, null, 2), 'application/json');
+    $('#arSelInfo').textContent = '✓ 已导出 ' + r.total + ' 条到 选品归档-' + dstr + '.json';
+  });
+  $('#arQ').addEventListener('keydown', (e) => { if (e.key === 'Enter') { loadItems(); loadStats(); } });
+  $('#arDedup').addEventListener('change', () => { loadItems(); loadStats(); });
+  $('#arStatSite').addEventListener('change', () => { loadItems(); loadStats(); });
+  /* ★ 筛选条: 应用/重置 + 下拉即时生效(数字框回车或点「应用筛选」) */
+  const applyFilters = () => { loadItems(); loadStats(); };
+  $('#arApply').addEventListener('click', applyFilters);
+  ['arCat1', 'arTag', 'arMarginMin', 'arSalesMin', 'arRankMax', 'arPriceMin', 'arPriceMax'].forEach((id) => {
+    const el = $('#' + id);
+    if (el) el.addEventListener('change', applyFilters);
+    if (el) el.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyFilters(); });
+  });
+  $('#arResetFilter').addEventListener('click', () => {
+    ['arCat1', 'arTag', 'arMarginMin', 'arSalesMin', 'arRankMax', 'arPriceMin', 'arPriceMax', 'arStatSite'].forEach((id) => { const el = $('#' + id); if (el) el.value = ''; });
+    const q = $('#arQ'); if (q) q.value = '';
+    applyFilters();
+  });
+  $('#arReload').addEventListener('click', () => { loadHead(); loadItems(); loadStats(); });
+
+  await loadHead();
+  /* ===== ★ 自动归档(③) 的界面部分 ===== */
+  const loadAuto = async () => {
+    const hourSel = $('#arAutoHour');
+    if (hourSel && !hourSel.options.length) {
+      hourSel.innerHTML = Array.from({ length: 24 }, (_, i) => '<option value="' + i + '">' + (i < 10 ? '0' + i : i) + ':00</option>').join('');
+    }
+    if (!$('#arAutoOn')) return;
+    let r;
+    try { r = await API('/api/archive/auto'); } catch (e) { $('#arAutoInfo').textContent = '✗ ' + e.message; return }
+    const a = (r && r.auto) || {};
+    $('#arAutoOn').checked = a.enabled === true;
+    if (hourSel) hourSel.value = String(a.hour != null ? a.hour : 3);
+    $('#arAutoInfo').textContent = a.lastRunAt ? ('上次运行 ' + String(a.lastRunAt).slice(5, 16)) : '还没跑过';
+  };
+  const saveAuto = async (patch) => {
+    try {
+      await API('/api/archive/auto', { method: 'POST', body: JSON.stringify(patch) });
+      await loadAuto();
+    } catch (e) { $('#arAutoInfo').textContent = '✗ ' + e.message }
+  };
+  if ($('#arAutoOn')) $('#arAutoOn').addEventListener('change', () => saveAuto({ enabled: $('#arAutoOn').checked }));
+  if ($('#arAutoHour')) $('#arAutoHour').addEventListener('change', () => saveAuto({ hour: parseInt($('#arAutoHour').value, 10) }));
+  if ($('#arAutoRun')) $('#arAutoRun').addEventListener('click', async () => {
+    $('#arAutoInfo').textContent = '⏳ 正在归档…';
+    try {
+      const r = await API('/api/archive/auto/run', { method: 'POST', body: JSON.stringify({}) });
+      $('#arAutoInfo').textContent = r.created
+        ? ('✓ 已存「' + r.name + '」 ' + r.count + ' 条' + (r.dupCount ? ' (其中重复 ' + r.dupCount + ')' : ''))
+        : ('[--] ' + (r.reason || '没有新东西要存'));
+      await loadHead(); await loadItems(); await loadStats();
+    } catch (e) { $('#arAutoInfo').textContent = '✗ ' + e.message }
+  });
+
+  await loadHead();
+  await loadItems();
+  await loadStats();
+  await loadAuto();
+}
+
+
 /* ===== 通知 ===== */
 async function renderNotify() {
   const content = $('#content');
@@ -2813,26 +3814,20 @@ async function renderNotify() {
   $('#nRefresh').addEventListener('click', load);
 }
 
-/* ===== 物流工具: 运费试算比价 (云途官网 CDP 免费) + 物流配置 + 报价表管理 ===== */
+/* ===== 物流工具: 报价表试算 (本地费率) + 报价表管理 ===== */
+// (2026-09-20: 原「云途官网 CDP 免费试算」+「云途开放平台配置」已删除 ——
+//  后续实时物流价格改从智赢客户端「国际运费预估」的 UI 读取)
 async function renderLogistics() {
   const content = $('#content');
-  const cfg = await API('/api/logistics/config').catch(() => ({}));
   const rates = await API('/api/logistics/rates').catch(() => ({}));
   const stale = rates.updatedAt ? ((Date.now() - new Date(String(rates.updatedAt).replace(' ', 'T')).getTime()) > 86400000) : true;
   content.innerHTML = `
-    <div class="notice">📦 <b>物流工具:</b> 运费试算 (云途官网实时, 可选) · 报价表 (本地维护, 每日/手动更新, 一键计算优先使用) · 物流配置。</div>
+    <div class="notice">📦 <b>物流工具:</b> 报价表 (本地维护首重/续重, 「一键计算」优先用它算物流成本) · 报价表试算。</div>
     <div class="card">
-      <div class="card-title">${ic('logistics', 16)} 运费试算 <button id="lgQuote" class="btn primary" style="margin-left:auto">开始试算</button></div>
+      <div class="card-title">${ic('logistics', 16)} 报价表试算 <button id="lgQuote" class="btn primary" style="margin-left:auto">开始试算</button></div>
       <div class="filter-grid" style="margin-top:8px">
-        <div class="filter-item"><label>发件城市 (集货中转仓)</label><select id="lgCity" class="select">
-          <option>深圳市</option><option>广州市</option><option>义乌市</option><option>杭州市</option><option>上海市</option><option>厦门市</option><option>泉州市</option><option>福州市</option><option>郑州市</option><option>武汉市</option>
-        </select></div>
         <div class="filter-item"><label>目的国 (ISO2 代码)</label><input id="lgCountry" class="input" value="GB" placeholder="如 GB / DE / US / FR"></div>
         <div class="filter-item"><label>重量 (kg)</label><input id="lgWeight" class="input" type="number" step="0.1" value="1" placeholder="如 0.5 / 1 / 2"></div>
-        <div class="filter-item"><label>长 (cm, 可空)</label><input id="lgLen" class="input" type="number" placeholder="如 20"></div>
-        <div class="filter-item"><label>宽 (cm, 可空)</label><input id="lgWid" class="input" type="number" placeholder="如 15"></div>
-        <div class="filter-item"><label>高 (cm, 可空)</label><input id="lgHgt" class="input" type="number" placeholder="如 10"></div>
-        <div class="filter-item"><label>包裹类型</label><select id="lgBattery" class="select"><option value="0">普货</option><option value="1">带电</option></select></div>
       </div>
       <div id="lgResult" style="margin-top:12px"></div>
     </div>
@@ -2846,7 +3841,7 @@ async function renderLogistics() {
       <div id="lgRateForm" style="display:none;margin-top:8px;border:1px dashed var(--line);border-radius:8px;padding:10px">
         <div class="filter-grid" style="grid-template-columns:repeat(auto-fill,minmax(140px,1fr))">
           <div class="filter-item"><label>国家 (ISO2)</label><input id="lrCountry" class="input" value="GB" placeholder="GB"></div>
-          <div class="filter-item"><label>渠道名称</label><input id="lrChannel" class="input" placeholder="如 云途全球专线挂号"></div>
+          <div class="filter-item"><label>渠道名称</label><input id="lrChannel" class="input" placeholder="如 全球专线挂号"></div>
           <div class="filter-item"><label>类型</label><input id="lrType" class="input" placeholder="专线/快速"></div>
           <div class="filter-item"><label>首重 (kg)</label><input id="lrFirstW" class="input" type="number" step="0.1" value="0.5"></div>
           <div class="filter-item"><label>首重价 (¥)</label><input id="lrFirstP" class="input" type="number" step="0.1" value="50"></div>
@@ -2857,50 +3852,35 @@ async function renderLogistics() {
         <div class="toolbar" style="margin-top:6px"><button id="lrSave" class="btn primary">保存渠道</button><button id="lrCancel" class="btn">取消</button><span class="muted" id="lrMsg"></span></div>
       </div>
     </div>
-    <div class="card" style="margin-top:12px">
-      <div class="card-title">${ic('setting', 14)} 物流配置</div>
-      <div class="muted" style="font-size:12px;margin:6px 0">云途开放平台 sourcekey 与 API 密钥 (申请后填, 用于官方 API 对接; 当前试算用报价表+CDP 免费通道)</div>
-      <div class="toolbar" style="gap:8px;flex-wrap:wrap">
-        <input id="lgSourceKey" class="input" placeholder="云途 sourcekey" value="${esc((cfg.sourcekey || ''))}" style="width:180px">
-        <input id="lgAppToken" class="input" placeholder="云途 AppToken (API密钥)" value="${esc((cfg.appToken || ''))}" style="width:220px">
-        <button id="lgSaveCfg" class="btn">保存配置</button>
-        <span class="muted" id="lgCfgMsg"></span>
-      </div>
-      <div class="muted" style="font-size:11px;margin-top:6px">sourcekey: <b>${esc(cfg.sourcekey || '未配置')}</b> · 从开放平台【控制台→用户信息】获取</div>
-    </div>
   `;
-  // 开始试算
+  // 开始试算 (本地报价表)
   $('#lgQuote').addEventListener('click', async () => {
     const btn = $('#lgQuote');
     const box = $('#lgResult');
+    const cc = $('#lgCountry').value.trim().toUpperCase();
+    const wkg = parseFloat($('#lgWeight').value) || 1;
     btn.textContent = '试算中…'; btn.disabled = true;
-    box.innerHTML = '<div class="muted" style="padding:8px 0">正在打开云途官网试算 (约 25 秒)…</div>';
+    box.innerHTML = '<div class="muted" style="padding:8px 0">正在按报价表计算…</div>';
     try {
-      const r = await API('/api/logistics/quote', { method: 'POST', body: JSON.stringify({
-        originCity: $('#lgCity').value, country: $('#lgCountry').value.trim().toUpperCase(),
-        weightKg: parseFloat($('#lgWeight').value) || 1,
-        lengthCm: parseFloat($('#lgLen').value) || 0, widthCm: parseFloat($('#lgWid').value) || 0, heightCm: parseFloat($('#lgHgt').value) || 0,
-        battery: $('#lgBattery').value === '1',
-      }) });
-      if (!r.ok || !r.quotes || !r.quotes.length) { box.innerHTML = `<div class="notice warn">⚠️ 未获取到报价: ${esc((r && r.error) || '云途试算无结果')}</div>`; return; }
-      const rows = r.quotes.map((q) => `<tr>
-        <td>${esc(q.channel)}</td><td>${esc(q.type)}</td><td>${esc(q.parcel)}</td><td>${esc(q.code)}</td>
-        <td>${esc(q.chargeable)}</td><td>${esc(q.eta)}</td><td><b>¥${q.total}</b></td>
-        <td class="muted" style="font-size:11px">运费¥${q.freight}${q.registrationFee ? '+挂号¥' + q.registrationFee : ''}${q.otherFee ? '+其他¥' + q.otherFee : ''}</td>
+      const r = await API('/api/logistics/rates?country=' + encodeURIComponent(cc) + '&weight=' + encodeURIComponent(wkg));
+      const quotes = (r && r.quotes) || [];
+      if (!quotes.length) {
+        box.innerHTML = `<div class="notice warn">⚠️ 报价表里没有 ${esc(cc)} 的费率 —— 请在下方「报价表」里新增该国各渠道的首重/续重价格</div>`;
+        return;
+      }
+      const rows = quotes.map((q) => `<tr>
+        <td>${esc(q.channel)}</td><td>${esc(q.type)}</td><td>${esc(q.eta)}</td>
+        <td>首重 ${esc(String(q.firstWeight))}kg ¥${esc(String(q.firstPrice))}</td>
+        <td>续重 ${esc(String(q.contWeight))}kg ¥${esc(String(q.contPrice))}</td>
+        <td><b>¥${q.total}</b></td>
       </tr>`).join('');
-      box.innerHTML = `<div class="muted" style="margin-bottom:6px">${esc(r.originCity)} → ${esc(r.country)} · ${r.weightKg}kg${r.lengthCm ? ` · ${r.lengthCm}x${r.widthCm}x${r.heightCm}cm` : ''} · ${r.battery ? '带电' : '普货'} · 共 <b>${r.quotes.length}</b> 个渠道 (¥ 为人民币)</div>
-        <table class="ov-table" style="width:100%"><thead><tr><th>渠道</th><th>类型</th><th>包裹</th><th>代码</th><th>计费重</th><th>时效</th><th>总费用</th><th>明细</th></tr></thead><tbody>${rows}</tbody></table>
-        <div class="muted" style="font-size:11px;margin-top:6px">${esc(r.note)}</div>`;
+      box.innerHTML = `<div class="muted" style="margin-bottom:6px">目的国 ${esc(cc)} · ${esc(String(wkg))}kg · 共 <b>${quotes.length}</b> 个渠道 · 报价表更新于 ${esc(r.updatedAt || '未记录')}</div>
+        <table class="ov-table" style="width:100%"><thead><tr><th>渠道</th><th>类型</th><th>时效</th><th>首重</th><th>续重</th><th>总费用</th></tr></thead><tbody>${rows}</tbody></table>
+        <div class="muted" style="font-size:11px;margin-top:6px">价格为报价表录入值, 请定期核对; 需要实时价可在智赢客户端「国际运费预估」里查。</div>`;
     } catch (e) {
       box.innerHTML = `<div class="notice warn">❌ 试算失败: ${esc((e && e.message) || e)}</div>`;
     }
     btn.textContent = '开始试算'; btn.disabled = false;
-  });
-  // 保存配置
-  $('#lgSaveCfg').addEventListener('click', async () => {
-    const r = await API('/api/logistics/config', { method: 'POST', body: JSON.stringify({ sourcekey: $('#lgSourceKey').value.trim(), appToken: $('#lgAppToken').value.trim() }) });
-    $('#lgCfgMsg').textContent = r.ok ? '✔ 已保存' : ('✗ ' + (r.error || '保存失败'));
-    if (r.ok) setTimeout(() => { $('#lgCfgMsg').textContent = ''; }, 2500);
   });
   // ===== 报价表管理 =====
   const renderRateList = () => {

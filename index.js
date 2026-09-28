@@ -63,7 +63,9 @@ export function apply(ctx) {
           valid: lic.valid, customer: lic.customer, expiresAt: lic.expiresAt,
           message: lic.message || null,
           // 未授权时把指纹给模型, 方便直接告诉用户"把这串发给授权方"
-          fingerprint: lic.valid ? undefined : lic.fingerprint,
+          // 注意: 这里必须是 null 而不是 undefined —— 带 undefined 值的属性不是 lossless JSON,
+          // 会让 zying_health 工具直接报 "returned invalid output"。已授权时本来也不需要指纹。
+          fingerprint: lic.valid ? null : lic.fingerprint,
           needLicense: !lic.valid,
         } : null,
       };
@@ -85,12 +87,12 @@ export function apply(ctx) {
     'zying list-direct');
 
   ctx.effect(() => ctx.tools.register(tool('zying_list_filtered',
-    '列表页筛选采集: 列表页直采 → 用筛选条件前置过滤 (FBA/FBM/排名/评分/关键词) → 只跳通过的商品取详情页数据 (含商标/跟卖) → 入库。返回各阶段数量。',
+    '列表页筛选采集: 列表页直采 → 用筛选条件前置过滤 (FBA/FBM/排名/评分/关键词) → 直接入库, 【不跳转详情页】。详情页专属字段 (价格/评论/类目/A+) 与插件面板字段 (商标/月销) 之后在「商品管理」里勾选商品用「一键补采」补。返回各阶段数量。',
     {
       url: { type: 'string', required: true, description: 'Amazon 列表页 URL' },
       maxPages: { type: 'number', description: '翻页数 (1-10, 默认1)' },
       filterFulfill: { type: 'string', enum: ['FBA', 'FBM'], description: '配送方式筛选 (仅采 FBA 或 FBM)' },
-      filterRankMax: { type: 'number', description: 'BSR 排名 ≤ 上限' },
+      filterRankMax: { type: 'number', description: '大排名 ≤ 上限 (大排名 = 所有排名里的最大值)' },
       filterRatingMin: { type: 'number', description: '评分 ≥ 下限 (0-5)' },
       filterReviewsMin: { type: 'number', description: '评论数 ≥ 下限' },
       filterQ: { type: 'string', description: '标题含关键词' },

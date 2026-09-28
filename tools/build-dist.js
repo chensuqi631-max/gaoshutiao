@@ -32,7 +32,8 @@ const NO_LICENSE = hasFlag('no-license');
 const ENFORCE = !NO_LICENSE;
 const CLEAN = hasFlag('clean');   // --clean: 连授权模块/公钥一起剥掉 (免费版, 包里看不到授权机制)
 // 只带运行必需的东西: 源码/工具/数据都不进包 (数据在用户主目录, 授权文件由用户自己放)
-const ERP_FILES = ['server.js', 'license.js', path.join('tools', 'license-pub.pem')];
+// ⚠ 新增后端模块后必须登记到这里, 否则插件装上了却 "Cannot find module" (实测踩过 glob 之外漏 links-collector.js)
+const ERP_FILES = ['server.js', 'license.js', 'links-collector.js', 'link-jobs.js', 'rank-utils.js', path.join('tools', 'license-pub.pem')];
 const ERP_DIRS = ['public'];
 const NEVER = [/license-priv\.pem$/, /license\.key$/, /\.bak/i, /node_modules/, /_dev-tools/];
 

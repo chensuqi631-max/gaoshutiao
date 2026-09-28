@@ -362,6 +362,23 @@ pre.dump { white-space: pre-wrap; font-family: "Cascadia Code", Consolas, monosp
 [data-theme="dark"] .p-main-img { border-color:#333a45; background:#1c1f26; }
 [data-theme="dark"] .p-main-img.ph { background:#262a33; color:#6b7280; }
 
+/* ===== 商品管理列表: 收紧留白 =====================================================
+ * 原来用的是全局 th, td { padding: 9px 10px } —— 16 列的宽表里, 一个商品行的留白比
+ * 内容还显眼; 主图 70×70 又把行高顶到 90px 上下, 一屏只能看五六行。
+ * 这里只针对商品管理那张表(#cTable)收紧: 左右留白先砍(它才是"空"的来源),
+ * 上下保留 5px 让密集的 badge/pill 不至于贴在一起 —— 目标是紧凑, 不是挤成一团。
+ * 别的表格(合规/刊登/调价/详情)不受影响。
+ * ==========================================================================*/
+#cTable th, #cTable td { padding:5px 6px; }
+#cTable .p-main-img { width:44px; height:44px; border-radius:6px; }
+#cTable .p-main-img.ph { font-size:17px; }
+#cTable .big-rank { font-size:11px; padding:1px 5px; border-radius:5px; }
+#cTable .pill { padding:1px 6px; margin-right:3px; }
+#cTable .small-rank { margin-top:1px; }
+#cTable .badge { padding:1px 6px; }
+#cTable .btn.small { padding:2px 6px; }
+#cTable td[style*="max-width:400px"] > div { gap:2px; }   /* 主图/大排名/标题之间的缝隙 */
+
 /* ===== 排名显示 ===== */
 .big-rank { font-weight:700; font-size:12px; color:var(--muted); background:var(--card-2); border:1px solid #f0d9b8; border-radius:6px; padding:2px 6px; white-space:nowrap; flex-shrink:0; }
 .small-rank { font-size:11px; color:#888; margin-top:3px; }
