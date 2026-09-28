@@ -60,7 +60,9 @@ export function apply(ctx) {
       return {
         online: true, total: p.total, time: new Date().toISOString(),
         license: lic ? {
-          valid: lic.valid, customer: lic.customer, expiresAt: lic.expiresAt,
+          valid: lic.valid, customer: lic.customer,
+          // 期限: expiresAt 为 null = 永久授权（签发时不传 --days/--exp）
+          expiresAt: lic.expiresAt, perpetual: !lic.expiresAt,
           message: lic.message || null,
           // 未授权时把指纹给模型, 方便直接告诉用户"把这串发给授权方"
           // 注意: 这里必须是 null 而不是 undefined —— 带 undefined 值的属性不是 lossless JSON,

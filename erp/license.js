@@ -128,7 +128,11 @@ function licenseStatus() {
     licenseCandidates: LICENSE_CANDIDATES,
     dataDir: DATA,
     // 一句话结论, 前端直接显示
-    summary: !enforce ? '未启用授权校验 (开发模式)' : (v.ok ? '已授权: ' + (v.payload.name || v.payload.id) + (v.payload.exp ? ' · 到期 ' + v.payload.exp : '') : '未授权: ' + (v.msg || v.reason)),
+    // ★ 期限: 没写 exp = 永久授权（签发时不传 --days/--exp 就是这种）
+    summary: !enforce ? '未启用授权校验 (开发模式)'
+      : (v.ok
+        ? '已授权: ' + (v.payload.name || v.payload.id) + (v.payload.exp ? ' · 到期 ' + v.payload.exp : ' · 永久')
+        : '未授权: ' + (v.msg || v.reason)),
   };
 }
 
