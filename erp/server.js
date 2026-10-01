@@ -130,6 +130,26 @@ const REPORT_MAX = 300;                 // 只留最近 300 条, 防止文件无
 const linkJobs = require('./link-jobs.js');
 const linkJobStore = new linkJobs.JobStore(path.join(DATA, 'link-jobs'));
 
+/* 知识产权查重 (上架风控) —— 直连官方商标/外观设计库, 见 ip-check.js 顶部说明。
+ * ★ 打包/分发时文件白名单必须带上 ip-check.js。 */
+const ipCheck = require('./ip-check.js');
+
+/* 批量知产查重的作业状态(内存态, 重启即清) —— 查重是"一串串行外部请求",
+ * 一次批量几十分钟, 不能让 HTTP 连接挂着等, 所以学采集那样做成"后台跑 + 轮询进度"。 */
+let ipBatch = null;
+
+/** 批量知产查重的进度快照(不含明细, 给轮询用) */
+function ipBatchSummary() {
+  if (!ipBatch) return { running: false, batch: null };
+  return {
+    id: ipBatch.id, running: !!ipBatch.running, startedAt: ipBatch.startedAt, finishedAt: ipBatch.finishedAt || null,
+    total: ipBatch.total, done: ipBatch.done, current: ipBatch.current,
+    matchedProducts: ipBatch.matched, apply: ipBatch.apply, field: ipBatch.field,
+    summary: ipBatch.summary, errors: ipBatch.errors.slice(-20),
+    progress: ipBatch.total ? Math.round((ipBatch.done / ipBatch.total) * 100) : 0,
+  };
+}
+
 /* 离线集成测试口子: ZY_TEST_FAKE_CDP=1 时用假 CDP 端点, 让「多链接采集」的整条 HTTP 链路
  * (守卫 → 建任务 → 逐单元落盘 → 续跑 → 重跑失败 → 删除) 可以离线跑完整。
  * 生产/正常使用时不设这个变量, 这里恒为 null, 行为完全不变。 */
@@ -12067,6 +12087,177 @@ const server = http.createServer((req, res) => {
         const prod = products.find((x) => x.asin === j.asin) || j;
         const r = correctCompliance(prod, j.verdict || '未备案');
         return send(200, r);
+      }
+
+      /* ================= 知识产权查重 (上架风控) =================
+       * 直连官方库, 不需要浏览器:
+       *   tmview     TMview 全球商标库 (70+ 局, 含中国)      ← 主力
+       *   uspto      USPTO 美国商标 (状态码/商品服务项最全)
+       *   euipo-tm   EUIPO 欧盟商标
+       *   euipo-rcd  EUIPO 共同体外观设计 (★ 带设计图)
+       * 需要浏览器自动化的(未接入): WIPO 品牌库/外观库、中国商标网
+       * ========================================================= */
+
+      if (p === '/api/ip/providers' && req.method === 'GET') {
+        return send(200, { ok: true, providers: ipCheck.providerList(), defaultSources: ipCheck.DEFAULT_SOURCES, offices: ipCheck.OFFICES, cache: ipCheck.cacheStats() });
+      }
+
+      if (p === '/api/ip/cache/clear' && (req.method === 'POST' || req.method === 'GET')) {
+        return send(200, { ...ipCheck.cacheClear(), ...ipCheck.cacheStats() });
+      }
+
+      // 单个关键词查重: GET /api/ip/search?q=xxx&sources=tmview,uspto&nice=11&locarno=07-01&limit=30
+      if (p === '/api/ip/search' && req.method === 'GET') {
+        const q = url.searchParams.get('q') || url.searchParams.get('term') || '';
+        const opt = {
+          sources: (url.searchParams.get('sources') || '').split(',').map((s) => s.trim()).filter(Boolean),
+          offices: (url.searchParams.get('offices') || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean),
+          nice: ipCheck.parseNiceList(url.searchParams.get('nice')),
+          locarno: (url.searchParams.get('locarno') || '').split(',').map((s) => s.trim()).filter(Boolean),
+          limit: parseInt(url.searchParams.get('limit') || '30', 10),
+        };
+        const r = await ipCheck.search(q, opt);
+        if (r.error) return send(400, r);
+        return send(200, { ...r, providerList: undefined });
+      }
+
+      if (p === '/api/ip/search' && req.method === 'POST') {
+        const opt = {
+          sources: Array.isArray(j.sources) ? j.sources : String(j.sources || '').split(',').filter(Boolean),
+          offices: Array.isArray(j.offices) ? j.offices : [],
+          nice: j.nice, locarno: j.locarno,
+          limit: j.limit || 30,
+          aliveOnly: j.aliveOnly !== false,
+          registeredOnly: !!j.registeredOnly,
+        };
+        const r = await ipCheck.search(j.q || j.term, opt);
+        if (r.error) return send(400, r);
+        return send(200, { ...r, providerList: undefined });
+      }
+
+      // 只出结论(不返回命中明细), 供前端列表/徽章用
+      if (p === '/api/ip/risk' && (req.method === 'GET' || req.method === 'POST')) {
+        const src = req.method === 'GET'
+          ? { q: url.searchParams.get('q'), sources: (url.searchParams.get('sources') || '').split(',').filter(Boolean), nice: url.searchParams.get('nice'), locarno: url.searchParams.get('locarno') }
+          : j;
+        const r = await ipCheck.search(src.q || src.term, { sources: src.sources, nice: src.nice, locarno: src.locarno, limit: src.limit || 20 });
+        if (r.error) return send(400, r);
+        const v = ipCheck.brandVerdict(r.risk);
+        return send(200, { ok: true, term: r.term, risk: r.risk, verdict: v, sources: r.sources, total: r.total });
+      }
+
+      // 批量查重(后台跑): POST { asins:[...] | all:true, field:'brand'|'title', sources, nice, apply:true, limit }
+      if (p === '/api/ip/batch' && req.method === 'POST') {
+        if (ipBatch && ipBatch.running) return send(409, { error: '已有批量查重正在运行', batch: ipBatchSummary() });
+        const field = j.field === 'title' ? 'title' : 'brand';
+        let list = [];
+        if (Array.isArray(j.asins) && j.asins.length) {
+          const set = new Set(j.asins);
+          list = products.filter((x) => set.has(x.asin));
+        } else if (j.all) {
+          list = products.slice();
+        } else {
+          // 默认: 从筛选结果里取前 N 条有品牌名、且没查过的
+          list = products.filter((x) => (x[field] || '').trim());
+          if (j.onlyUnchecked) list = list.filter((x) => x.ipCheck == null);
+        }
+        const skip = String(j.skip || '').split(',').map((s) => s.trim()).filter(Boolean);
+        if (skip.length) list = list.filter((x) => !skip.some((s) => String(x[field] || '').toLowerCase().includes(s.toLowerCase())));
+        const cap = Math.max(1, Math.min(200, parseInt(j.limit || '30', 10) || 30));
+        // 同一个关键词只查一次: 按归一化关键词去重
+        const byTerm = new Map();
+        list.forEach((x) => {
+          const t = String(x[field] || '').trim();
+          if (!t) return;
+          const k = ipCheck.normTerm(t);
+          if (!k || byTerm.has(k)) return;
+          byTerm.set(k, { term: t, asins: [] });
+        });
+        list.forEach((x) => {
+          const k = ipCheck.normTerm(String(x[field] || '').trim());
+          if (k && byTerm.has(k)) byTerm.get(k).asins.push(x.asin);
+        });
+        const terms = [...byTerm.values()].slice(0, cap);
+
+        ipBatch = {
+          id: 'ipb-' + Date.now().toString(36), running: true, startedAt: now(),
+          field, apply: j.apply !== false, opts: { sources: j.sources, nice: j.nice, locarno: j.locarno, limit: j.limit || 20 },
+          total: terms.length, done: 0, current: '', results: [], summary: { high: 0, medium: 0, low: 0, none: 0, unknown: 0, registered: 0, notfound: 0 },
+          matched: list.length, errors: [],
+        };
+        const batchRef = ipBatch;
+
+        (async () => {
+          for (const t of terms) {
+            if (!batchRef.running) break;
+            batchRef.current = t.term;
+            try {
+              const r = await ipCheck.search(t.term, batchRef.opts);
+              const v = ipCheck.brandVerdict(r.risk);
+              batchRef.results.push({ term: t.term, asins: t.asins, risk: r.risk, verdict: v, total: r.total });
+              batchRef.summary[r.risk.level] = (batchRef.summary[r.risk.level] || 0) + 1;
+              batchRef.summary[v.brandStatus] = (batchRef.summary[v.brandStatus] || 0) + 1;
+              if (batchRef.apply) {
+                t.asins.forEach((a) => {
+                  const prod = products.find((x) => x.asin === a);
+                  if (!prod) return;
+                  prod.ipCheck = {
+                    at: now(), term: t.term, level: r.risk.level, score: r.risk.score,
+                    tmAlive: r.risk.trademark.alive, tmExactAlive: r.risk.trademark.exactAlive,
+                    dzAlive: r.risk.design.alive, advice: r.risk.advice, text: v.text,
+                  };
+                  prod.brandStatus = v.brandStatus;
+                  prod.trademarkCount = v.trademarkCount;
+                  prod.tmText = v.text;
+                  const offices = [...new Set(r.items.filter((h) => h.statusGroup === 'alive').map((h) => h.office).filter(Boolean))];
+                  prod.tmCountries = offices;
+                });
+              }
+            } catch (e) {
+              batchRef.errors.push({ term: t.term, error: String((e && e.message) || e) });
+            }
+            batchRef.done++;
+          }
+          batchRef.running = false;
+          batchRef.current = '';
+          batchRef.finishedAt = now();
+          if (batchRef.apply) { save('products.json', products, true); }
+          try { pushNotify('知产查重完成', `批量查重 ${batchRef.done}/${batchRef.total} 个关键词`, `高危 ${batchRef.summary.high || 0} · 中风险 ${batchRef.summary.medium || 0} · 低风险 ${batchRef.summary.low || 0} · 无冲突 ${batchRef.summary.none || 0}`); } catch (e) { }
+        })();
+
+        return send(200, { ok: true, id: ipBatch.id, total: ipBatch.total, matchedProducts: ipBatch.matched, field, batch: ipBatchSummary() });
+      }
+
+      if (p === '/api/ip/batch' && req.method === 'GET') {
+        if (!ipBatch) return send(200, { ok: true, running: false, batch: null });
+        return send(200, { ok: true, ...ipBatchSummary(), batch: { ...ipBatch, results: ipBatch.results.slice(-40) } });
+      }
+
+      if (p === '/api/ip/batch/stop' && req.method === 'POST') {
+        if (!ipBatch) return send(200, { ok: true, running: false });
+        ipBatch.running = false;
+        return send(200, { ok: true, stopped: true, ...ipBatchSummary() });
+      }
+
+      if (p === '/api/ip/batch/clear' && req.method === 'POST') {
+        if (ipBatch && ipBatch.running) return send(409, { error: '正在运行, 先停止再清空' });
+        ipBatch = null;
+        return send(200, { ok: true });
+      }
+
+      // 商品库知产风险总览
+      if (p === '/api/ip/overview' && req.method === 'GET') {
+        const checked = products.filter((x) => x.ipCheck);
+        const byLevel = {}; const byStatus = {};
+        checked.forEach((x) => {
+          byLevel[x.ipCheck.level] = (byLevel[x.ipCheck.level] || 0) + 1;
+          const s = x.brandStatus || 'unchecked';
+          byStatus[s] = (byStatus[s] || 0) + 1;
+        });
+        return send(200, {
+          ok: true, total: products.length, checked: checked.length, unchecked: products.length - checked.length,
+          byLevel, byStatus, cache: ipCheck.cacheStats(),
+        });
       }
 
       if (p === '/api/claims' && req.method === 'GET') return send(200, { total: claims.length, items: claims });
