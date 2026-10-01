@@ -12099,17 +12099,23 @@ const server = http.createServer((req, res) => {
        * ========================================================= */
 
       if (p === '/api/ip/providers' && req.method === 'GET') {
-        return send(200, { ok: true, providers: ipCheck.providerList(), defaultSources: ipCheck.DEFAULT_SOURCES, offices: ipCheck.OFFICES, cache: ipCheck.cacheStats() });
+        return send(200, {
+          ok: true, providers: ipCheck.providerList(), defaultSources: ipCheck.DEFAULT_SOURCES,
+          sites: ipCheck.siteList(), offices: ipCheck.OFFICES, cache: ipCheck.cacheStats(),
+          euMembers: ipCheck.EU_MEMBERS,
+        });
       }
 
       if (p === '/api/ip/cache/clear' && (req.method === 'POST' || req.method === 'GET')) {
         return send(200, { ...ipCheck.cacheClear(), ...ipCheck.cacheStats() });
       }
 
-      // 单个关键词查重: GET /api/ip/search?q=xxx&sources=tmview,uspto&nice=11&locarno=07-01&limit=30
+      // 单个关键词查重: GET /api/ip/search?q=xxx&sites=amazon.de&sources=tmview&nice=11&limit=30
+      // ★ sites 是核心参数: 决定"只看哪个市场有效的商标" —— 上德国站就只看在德国有效的。
       if (p === '/api/ip/search' && req.method === 'GET') {
         const q = url.searchParams.get('q') || url.searchParams.get('term') || '';
         const opt = {
+          sites: (url.searchParams.get('sites') || url.searchParams.get('site') || '').split(',').map((s) => s.trim()).filter(Boolean),
           sources: (url.searchParams.get('sources') || '').split(',').map((s) => s.trim()).filter(Boolean),
           offices: (url.searchParams.get('offices') || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean),
           nice: ipCheck.parseNiceList(url.searchParams.get('nice')),
@@ -12118,11 +12124,12 @@ const server = http.createServer((req, res) => {
         };
         const r = await ipCheck.search(q, opt);
         if (r.error) return send(400, r);
-        return send(200, { ...r, providerList: undefined });
+        return send(200, r);
       }
 
       if (p === '/api/ip/search' && req.method === 'POST') {
         const opt = {
+          sites: Array.isArray(j.sites) ? j.sites : (j.sites ? String(j.sites).split(',').filter(Boolean) : []),
           sources: Array.isArray(j.sources) ? j.sources : String(j.sources || '').split(',').filter(Boolean),
           offices: Array.isArray(j.offices) ? j.offices : [],
           nice: j.nice, locarno: j.locarno,
@@ -12132,21 +12139,26 @@ const server = http.createServer((req, res) => {
         };
         const r = await ipCheck.search(j.q || j.term, opt);
         if (r.error) return send(400, r);
-        return send(200, { ...r, providerList: undefined });
+        return send(200, r);
       }
 
       // 只出结论(不返回命中明细), 供前端列表/徽章用
       if (p === '/api/ip/risk' && (req.method === 'GET' || req.method === 'POST')) {
         const src = req.method === 'GET'
-          ? { q: url.searchParams.get('q'), sources: (url.searchParams.get('sources') || '').split(',').filter(Boolean), nice: url.searchParams.get('nice'), locarno: url.searchParams.get('locarno') }
+          ? {
+            q: url.searchParams.get('q'),
+            sites: (url.searchParams.get('sites') || url.searchParams.get('site') || '').split(',').filter(Boolean),
+            sources: (url.searchParams.get('sources') || '').split(',').filter(Boolean),
+            nice: url.searchParams.get('nice'), locarno: url.searchParams.get('locarno'),
+          }
           : j;
-        const r = await ipCheck.search(src.q || src.term, { sources: src.sources, nice: src.nice, locarno: src.locarno, limit: src.limit || 20 });
+        const r = await ipCheck.search(src.q || src.term, { sites: src.sites, sources: src.sources, nice: src.nice, locarno: src.locarno, limit: src.limit || 30 });
         if (r.error) return send(400, r);
         const v = ipCheck.brandVerdict(r.risk);
-        return send(200, { ok: true, term: r.term, risk: r.risk, verdict: v, sources: r.sources, total: r.total });
+        return send(200, { ok: true, term: r.term, market: r.market, risk: r.risk, verdict: v, sources: r.sources, skipped: r.skipped, total: r.total });
       }
 
-      // 批量查重(后台跑): POST { asins:[...] | all:true, field:'brand'|'title', sources, nice, apply:true, limit }
+      // 批量查重(后台跑): POST { asins:[...] | all:true, sites:['amazon.de'], field:'brand'|'title', sources, nice, apply:true, limit }
       if (p === '/api/ip/batch' && req.method === 'POST') {
         if (ipBatch && ipBatch.running) return send(409, { error: '已有批量查重正在运行', batch: ipBatchSummary() });
         const field = j.field === 'title' ? 'title' : 'brand';
@@ -12179,9 +12191,12 @@ const server = http.createServer((req, res) => {
         });
         const terms = [...byTerm.values()].slice(0, cap);
 
+        const sites = Array.isArray(j.sites) ? j.sites : (j.sites ? String(j.sites).split(',').filter(Boolean) : []);
         ipBatch = {
           id: 'ipb-' + Date.now().toString(36), running: true, startedAt: now(),
-          field, apply: j.apply !== false, opts: { sources: j.sources, nice: j.nice, locarno: j.locarno, limit: j.limit || 20 },
+          field, apply: j.apply !== false, sites,
+          market: ipCheck.marketFromSites(sites),
+          opts: { sites, sources: j.sources, nice: j.nice, locarno: j.locarno, limit: j.limit || 30 },
           total: terms.length, done: 0, current: '', results: [], summary: { high: 0, medium: 0, low: 0, none: 0, unknown: 0, registered: 0, notfound: 0 },
           matched: list.length, errors: [],
         };
@@ -12194,7 +12209,7 @@ const server = http.createServer((req, res) => {
             try {
               const r = await ipCheck.search(t.term, batchRef.opts);
               const v = ipCheck.brandVerdict(r.risk);
-              batchRef.results.push({ term: t.term, asins: t.asins, risk: r.risk, verdict: v, total: r.total });
+              batchRef.results.push({ term: t.term, asins: t.asins, risk: r.risk, verdict: v, total: r.total, market: r.market });
               batchRef.summary[r.risk.level] = (batchRef.summary[r.risk.level] || 0) + 1;
               batchRef.summary[v.brandStatus] = (batchRef.summary[v.brandStatus] || 0) + 1;
               if (batchRef.apply) {
@@ -12203,13 +12218,14 @@ const server = http.createServer((req, res) => {
                   if (!prod) return;
                   prod.ipCheck = {
                     at: now(), term: t.term, level: r.risk.level, score: r.risk.score,
+                    market: r.market ? r.market.name : null,
                     tmAlive: r.risk.trademark.alive, tmExactAlive: r.risk.trademark.exactAlive,
                     dzAlive: r.risk.design.alive, advice: r.risk.advice, text: v.text,
                   };
                   prod.brandStatus = v.brandStatus;
                   prod.trademarkCount = v.trademarkCount;
                   prod.tmText = v.text;
-                  const offices = [...new Set(r.items.filter((h) => h.statusGroup === 'alive').map((h) => h.office).filter(Boolean))];
+                  const offices = [...new Set(r.items.filter((h) => h.inMarket && h.statusGroup === 'alive').map((h) => h.office).filter(Boolean))];
                   prod.tmCountries = offices;
                 });
               }
@@ -12222,10 +12238,14 @@ const server = http.createServer((req, res) => {
           batchRef.current = '';
           batchRef.finishedAt = now();
           if (batchRef.apply) { save('products.json', products, true); }
-          try { pushNotify('知产查重完成', `批量查重 ${batchRef.done}/${batchRef.total} 个关键词`, `高危 ${batchRef.summary.high || 0} · 中风险 ${batchRef.summary.medium || 0} · 低风险 ${batchRef.summary.low || 0} · 无冲突 ${batchRef.summary.none || 0}`); } catch (e) { }
+          try { pushNotify('知产查重完成', `批量查重 ${batchRef.done}/${batchRef.total} 个关键词${batchRef.market ? ' · ' + batchRef.market.name : ''}`, `高危 ${batchRef.summary.high || 0} · 中风险 ${batchRef.summary.medium || 0} · 低风险 ${batchRef.summary.low || 0} · 无冲突 ${batchRef.summary.none || 0}`); } catch (e) { }
         })();
 
-        return send(200, { ok: true, id: ipBatch.id, total: ipBatch.total, matchedProducts: ipBatch.matched, field, batch: ipBatchSummary() });
+        return send(200, {
+          ok: true, id: ipBatch.id, total: ipBatch.total, matchedProducts: ipBatch.matched,
+          field, market: ipBatch.market ? { name: ipBatch.market.name, label: ipBatch.market.label } : null,
+          batch: ipBatchSummary(),
+        });
       }
 
       if (p === '/api/ip/batch' && req.method === 'GET') {

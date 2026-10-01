@@ -76,6 +76,93 @@ const OFFICES = {
 
 const officeName = (c) => OFFICES[String(c || '').toUpperCase()] || String(c || '未知');
 
+/* ============================ ★ 亚马逊站点 → 商标管辖「按站判定」 ============================
+ * 关键业务口径(用户明确要求): 我上德国站, 就只看"在德国有效的商标";
+ * 上英国站, 就只看"在英国有效的商标"。别的国家有商标不影响我上这个站。
+ *
+ * 要做到准, 必须理解三层权利范围 —— 这是最容易搞错的地方:
+ *   1) 单一国家商标:  DE 德国商标只保护德国；GB 英国商标只保护英国
+ *   2) 区域商标:      ★ EM 欧盟商标(EUTM) 一次性覆盖全部 27 个成员国 —— 所以德国站
+ *                     不仅要查 DE, 还要查 EM；反过来法国/意大利/西班牙站也一样
+ *   3) 国际注册:      WO 马德里体系国际注册, 保护范围是"指定国清单" —— 指定了 DE
+ *                     就在德国有效, 只指定了 AU/US 就跟德国无关
+ *
+ * TMview 每条记录都带 tProtection(保护范围)字段, 正好是判定的依据:
+ *   德国商标        → ["DE"]
+ *   欧盟商标        → ["AT","BE",...,"DE",...,"EM","BX"]   (27 国 + EM + BX)
+ *   国际注册        → ["DE","GB","AU",...] 或 ["WO"](尚未指定)
+ *   ★ 英国脱欧后欧盟商标不再覆盖英国: EUTM 的 tProtection 里没有 GB,
+ *     所以英国站只查 GB + WO, 不能把 EM 算进去 —— 这是最容易多报的地方。
+ *
+ * offices  = 去 TMview 检索时限定哪些局(减少无用请求)
+ * requires = 命中记录的保护范围里出现这些地区代码, 才算"在你这个站有风险"
+ * ========================================================================== */
+
+/** 欧盟 27 个成员国 —— 欧盟商标/共同体外观设计的保护范围 */
+const EU_MEMBERS = ['AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR', 'HU', 'IE', 'IT',
+  'LV', 'LT', 'LU', 'MT', 'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE'];
+/** 欧盟商标记录里 tProtection 出现的完整集合(27 国 + EM 自身 + BX 比荷卢) */
+const EU_PROTECTION = EU_MEMBERS.concat(['EM', 'BX']);
+
+/** 亚马逊各站点 → 商标管辖 */
+const AMAZON_SITES = {
+  'amazon.de': { cc: 'DE', name: '德国站', flag: '🇩🇪', region: 'EU', requires: ['DE'], offices: ['DE', 'EM', 'WO'] },
+  'amazon.co.uk': { cc: 'GB', name: '英国站', flag: '🇬🇧', region: 'UK', requires: ['GB'], offices: ['GB', 'WO'] },
+  'amazon.fr': { cc: 'FR', name: '法国站', flag: '🇫🇷', region: 'EU', requires: ['FR'], offices: ['FR', 'EM', 'WO'] },
+  'amazon.it': { cc: 'IT', name: '意大利站', flag: '🇮🇹', region: 'EU', requires: ['IT'], offices: ['IT', 'EM', 'WO'] },
+  'amazon.es': { cc: 'ES', name: '西班牙站', flag: '🇪🇸', region: 'EU', requires: ['ES'], offices: ['ES', 'EM', 'WO'] },
+  'amazon.nl': { cc: 'NL', name: '荷兰站', flag: '🇳🇱', region: 'EU', requires: ['NL', 'BX'], offices: ['NL', 'BX', 'EM', 'WO'] },
+  'amazon.com.be': { cc: 'BE', name: '比利时站', flag: '🇧🇪', region: 'EU', requires: ['BE', 'BX'], offices: ['BE', 'BX', 'EM', 'WO'] },
+  'amazon.se': { cc: 'SE', name: '瑞典站', flag: '🇸🇪', region: 'EU', requires: ['SE'], offices: ['SE', 'EM', 'WO'] },
+  'amazon.pl': { cc: 'PL', name: '波兰站', flag: '🇵🇱', region: 'EU', requires: ['PL'], offices: ['PL', 'EM', 'WO'] },
+  'amazon.ie': { cc: 'IE', name: '爱尔兰站', flag: '🇮🇪', region: 'EU', requires: ['IE'], offices: ['IE', 'EM', 'WO'] },
+  'amazon.com': { cc: 'US', name: '美国站', flag: '🇺🇸', region: 'NA', requires: ['US'], offices: ['US', 'WO'] },
+  'amazon.ca': { cc: 'CA', name: '加拿大站', flag: '🇨🇦', region: 'NA', requires: ['CA'], offices: ['CA', 'WO'] },
+  'amazon.com.mx': { cc: 'MX', name: '墨西哥站', flag: '🇲🇽', region: 'NA', requires: ['MX'], offices: ['MX', 'WO'] },
+  'amazon.com.br': { cc: 'BR', name: '巴西站', flag: '🇧🇷', region: 'NA', requires: ['BR'], offices: ['BR', 'WO'] },
+  'amazon.co.jp': { cc: 'JP', name: '日本站', flag: '🇯🇵', region: 'AP', requires: ['JP'], offices: ['JP', 'WO'] },
+  'amazon.com.au': { cc: 'AU', name: '澳洲站', flag: '🇦🇺', region: 'AP', requires: ['AU'], offices: ['AU', 'WO'] },
+  'amazon.sg': { cc: 'SG', name: '新加坡站', flag: '🇸🇬', region: 'AP', requires: ['SG'], offices: ['SG', 'WO'] },
+  'amazon.in': { cc: 'IN', name: '印度站', flag: '🇮🇳', region: 'AP', requires: ['IN'], offices: ['IN', 'WO'] },
+  'amazon.ae': { cc: 'AE', name: '阿联酋站', flag: '🇦🇪', region: 'ME', requires: ['AE'], offices: ['AE', 'WO'] },
+  'amazon.sa': { cc: 'SA', name: '沙特站', flag: '🇸🇦', region: 'ME', requires: ['SA'], offices: ['SA', 'WO'] },
+  'amazon.com.tr': { cc: 'TR', name: '土耳其站', flag: '🇹🇷', region: 'ME', requires: ['TR'], offices: ['TR', 'WO'] },
+  'amazon.eg': { cc: 'EG', name: '埃及站', flag: '🇪🇬', region: 'ME', requires: ['EG'], offices: ['EG', 'WO'] },
+  'amazon.co.za': { cc: 'ZA', name: '南非站', flag: '🇿🇦', region: 'AF', requires: ['ZA'], offices: ['ZA', 'WO'] },
+  'amazon.cn': { cc: 'CN', name: '中国站', flag: '🇨🇳', region: 'AP', requires: ['CN'], offices: ['CN', 'WO'] },
+  'amazon.com.hk': { cc: 'HK', name: '香港', flag: '🇭🇰', region: 'AP', requires: ['HK'], offices: ['HK', 'WO'] },
+};
+
+/** 站点清单(给前端渲染选择器) */
+function siteList() {
+  return Object.keys(AMAZON_SITES).map(function (k) {
+    const s = AMAZON_SITES[k];
+    return { id: k, cc: s.cc, name: s.name, flag: s.flag, region: s.region, offices: s.offices, requires: s.requires };
+  });
+}
+
+/** 把选中的站点(可多选)合成一个"目标市场"对象 */
+function marketFromSites(siteIds) {
+  const ids = (Array.isArray(siteIds) ? siteIds : String(siteIds || '').split(','))
+    .map(function (s) { return String(s).trim(); })
+    .filter(function (s) { return !!AMAZON_SITES[s]; });
+  if (!ids.length) return null;
+  const requires = [], offices = [], names = [], flags = [];
+  ids.forEach(function (id) {
+    const s = AMAZON_SITES[id];
+    s.requires.forEach(function (c) { if (requires.indexOf(c) < 0) requires.push(c); });
+    s.offices.forEach(function (c) { if (offices.indexOf(c) < 0) offices.push(c); });
+    names.push(s.name); flags.push(s.flag);
+  });
+  return {
+    sites: ids, requires, offices,
+    name: names.join(' + '),
+    flag: flags.join(''),
+    // 纯单一国家(没有区域局)时, 说明区域商标无关
+    label: names.join(' + ') + ' → 只看在 ' + requires.join('/') + ' 有效的商标',
+  };
+}
+
 /* ============================ 小工具 ============================ */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -244,50 +331,77 @@ function designStatusGroup(statusText) {
 
 /* ============================ 数据源 1: TMview 全球商标 ============================ */
 
-async function searchTmview(term, opts = {}) {
-  const pageSize = Math.max(1, Math.min(100, Number(opts.limit) || 30));
-  const body = {
-    page: String(opts.page || 1),
-    pageSize: String(pageSize),
-    criteria: 'C',
-    basicSearch: term,
-    fOffices: Array.isArray(opts.offices) && opts.offices.length ? opts.offices : [],
-  };
-  if (Array.isArray(opts.nice) && opts.nice.length) body.niceClass = opts.nice.map(String);
+const TMVIEW_HEADERS = {
+  'content-type': 'application/json', 'user-agent': UA,
+  origin: 'https://www.tmdn.org', referer: 'https://www.tmdn.org/tmview/',
+};
+const TMVIEW_API = 'https://www.tmdn.org/tmview/api/search/results';
 
-  const key = 'tmview|' + normTerm(term) + '|' + (body.fOffices.join(',') || '*') + '|' + ((body.niceClass || []).join(',') || '*') + '|' + pageSize;
+function mapTmviewRow(t) {
+  return {
+    source: 'tmview', sourceName: 'TMview 全球商标库',
+    kind: 'trademark',
+    id: t.ST13 || t.applicationNumber || '',
+    title: t.tmName || '',
+    type: t.tradeMarkType || '',
+    office: t.tmOffice || '', officeName: officeName(t.tmOffice),
+    protection: t.tProtection || [],
+    status: t.tradeMarkStatus || '', statusGroup: tmStatusGroup(t.tradeMarkStatus),
+    owner: (t.applicantName || [])[0] || '',
+    nice: (t.niceClass || []).map(Number),
+    filed: fmtDate(t.applicationDate), registered: '', expiry: '',
+    images: [], detailUrl: t.tmOfficeURL || '',
+    mediaUrl: t.tmOfficeURL || '',
+  };
+}
+
+async function searchTmview(term, opts = {}) {
+  /* pageSize 下限给到 50(而不是直接用显示条数): TMview 按相关度排序, 精确同名排在最前,
+   * 但"去掉空格后同名"的写法(如 AIRFRYER vs AIR FRYER)可能排在后面 —— 多拿一点更保险。
+   * 市场口径下命中总数通常很小(德国站 "air fryer" 只有 20 条), 成本可以忽略。 */
+  const pageSize = Math.max(50, Math.min(100, Number(opts.limit) || 30));
+  const fOffices = Array.isArray(opts.offices) && opts.offices.length ? opts.offices : [];
+  const niceClass = Array.isArray(opts.nice) && opts.nice.length ? opts.nice.map(String) : null;
+
+  const key = 'tmview|' + normTerm(term) + '|' + (fOffices.join(',') || '*') + '|' + ((niceClass || []).join(',') || '*') + '|' + pageSize;
   const hit = cacheGet(key);
   if (hit) return { ...hit, cached: true };
 
-  const d = await enqueue('tmdn.org', () => withRetry(() => httpJson('https://www.tmdn.org/tmview/api/search/results', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json', 'user-agent': UA,
-      origin: 'https://www.tmdn.org', referer: 'https://www.tmdn.org/tmview/',
-    },
-    body: JSON.stringify(body),
+  const body = { page: String(opts.page || 1), pageSize: String(pageSize), criteria: 'C', basicSearch: term, fOffices };
+  if (niceClass) body.niceClass = niceClass;
+
+  const d = await enqueue('tmdn.org', () => withRetry(() => httpJson(TMVIEW_API, {
+    method: 'POST', headers: TMVIEW_HEADERS, body: JSON.stringify(body),
   })));
 
-  const items = (d.tradeMarks || []).map((t) => {
-    const st = tmStatusGroup(t.tradeMarkStatus);
-    return {
-      source: 'tmview', sourceName: 'TMview 全球商标库',
-      kind: 'trademark',
-      id: t.ST13 || t.applicationNumber || '',
-      title: t.tmName || '',
-      type: t.tradeMarkType || '',
-      office: t.tmOffice || '', officeName: officeName(t.tmOffice),
-      protection: t.tProtection || [],
-      status: t.tradeMarkStatus || '', statusGroup: st,
-      owner: (t.applicantName || [])[0] || '',
-      nice: (t.niceClass || []).map(Number),
-      filed: fmtDate(t.applicationDate), registered: '', expiry: '',
-      images: [], detailUrl: t.tmOfficeURL || '',
-      mediaUrl: t.tmOfficeURL || '',
-    };
-  });
+  let rows = (d.tradeMarks || []).slice();
+  const totalAll = d.totalResults || 0;
 
-  const out = { source: 'tmview', sourceName: 'TMview 全球商标库', total: d.totalResults || 0, totalPages: d.totalPages || 0, items, cached: false };
+  /* ★ 关键: 结果被截断时必须补一次「精确匹配」查询。
+   * 否则同名商标一旦排在第 pageSize 名之后, 就会被判成"没风险" —— 这是最危险的漏判。
+   * criteria:'E' 是精确口径(实测 "air fryer" 由 20 条收敛到 3 条), 拿它兜底最省事。 */
+  let exactAdded = 0;
+  if (totalAll > rows.length) {
+    try {
+      const bodyE = Object.assign({}, body, { criteria: 'E', pageSize: '100' });
+      const dE = await enqueue('tmdn.org', () => withRetry(() => httpJson(TMVIEW_API, {
+        method: 'POST', headers: TMVIEW_HEADERS, body: JSON.stringify(bodyE),
+      })));
+      const have = new Set(rows.map((x) => (x.ST13 || '') + '|' + (x.tmName || '')));
+      (dE.tradeMarks || []).forEach((x) => {
+        const k = (x.ST13 || '') + '|' + (x.tmName || '');
+        if (have.has(k)) return;
+        have.add(k); rows.push(x); exactAdded++;
+      });
+    } catch (e) { /* 兜底查询失败不影响主流程 */ }
+  }
+
+  const items = rows.map(mapTmviewRow);
+  const out = {
+    source: 'tmview', sourceName: 'TMview 全球商标库',
+    total: totalAll, totalPages: d.totalPages || 0, items, cached: false,
+    exactAdded, truncated: totalAll > (d.tradeMarks || []).length,
+  };
   cacheSet(key, out);
   return out;
 }
@@ -328,6 +442,7 @@ async function searchUspto(term, opts = {}) {
       kind: 'trademark',
       id: s.id || h.id || '', title: s.wordmark || (s.markDescription || [])[0] || '(图形商标)',
       type: (s.markType || [])[0] || '', office: 'US', officeName: '美国',
+      protection: ['US'],
       status: s.statusDescription || '', statusCode: s.statusCode || null, statusGroup: st,
       alive: !!s.alive, registered: !!s.registered,
       owner: (s.ownerName || [])[0] || '',
@@ -384,6 +499,7 @@ async function searchEuipoTm(term, opts = {}) {
       kind: 'trademark',
       id: s.number || '', title: s.name || '', type: s.type || '',
       office: 'EM', officeName: '欧盟',
+      protection: EU_PROTECTION.slice(),   // 欧盟商标一次性覆盖全部 27 个成员国
       status: s.status || '', statusGroup: st,
       owner: s.applicantname || '',
       nice: String(s.nice || '').split(/[,\s]+/).map((x) => parseInt(x, 10)).filter(Boolean),
@@ -440,6 +556,7 @@ async function searchEuipoRcd(term, opts = {}) {
       id: s.number || s.applicantsreference || '', title: s.name || '',
       type: 'Design',
       office: 'EM', officeName: '欧盟',
+      protection: EU_PROTECTION.slice(),   // 共同体外观设计同样覆盖全部 27 个成员国
       status: s.status || '', statusGroup: st,
       owner: s.applicantname || '',
       locarno: s.classnumber || '', indication: s.indicationdesc || '',
@@ -516,7 +633,9 @@ const PROVIDERS = {
   },
 };
 
-const DEFAULT_SOURCES = ['tmview'];
+/* 默认查全部已接入的 API 数据源 —— 不用怕多余:
+ * search() 会按目标站点自动裁剪(上英国站会自动跳过欧盟局, 上德国站会自动跳过美国局)。 */
+const DEFAULT_SOURCES = ['tmview', 'uspto', 'euipo-tm', 'euipo-rcd'];
 
 function providerList() {
   return Object.values(PROVIDERS).map((p) => ({
@@ -537,22 +656,26 @@ function parseNiceList(v) {
 const LEVEL_RANK = { unknown: 0, none: 1, low: 2, medium: 3, high: 4 };
 const worse = (a, b) => (LEVEL_RANK[a] >= LEVEL_RANK[b] ? a : b);
 
-const ADVICE = {
-  high: '❌ 高危 —— 不建议上架。改名或换款后再查一次。',
-  medium: '⚠️ 中风险 —— 上架前建议咨询代理机构，或改用自有品牌名。',
-  low: '✅ 低风险 —— 可用，但请自行确认图形商标与外观设计。',
-  none: '✅ 未查到冲突 —— 可用。',
-  unknown: '❓ 查询失败 —— 请稍后重试或换数据源。',
+const ADVICE_MARKET = {
+  high: (m) => `❌ 高危 —— 这个站不能上。该名称在 ${m} 已有有效注册商标。`,
+  medium: (m) => `⚠️ 中风险 —— 上 ${m} 前建议改名或咨询代理。`,
+  low: (m) => `✅ 低风险 —— 在 ${m} 可以上，但请自行确认图形商标与外观设计。`,
+  none: (m) => `✅ 在 ${m} 未查到冲突 —— 可以上。`,
+  unknown: () => '❓ 查询失败 —— 请稍后重试或换数据源。',
 };
 
 /**
- * 风险判定
- * ★ 商标和外观是两套完全不同的判断逻辑，必须分开算：
- *    · 商标: 文字相同/近似 = 直接侵权风险 —— 文字命中就是强证据
- *    · 外观: 保护的是"造型"，文字名称只是线索(很多设计名就是描述词)
- *            —— 文字命中最多算中风险，真正的判断要看设计图
- * @param {Array} hits 归一化后的命中条目(带 kind)
- * @param {Object} opt { term, nice:[], locarno:[] }
+ * 风险判定 —— ★ 完全按「目标市场」口径算
+ *
+ * 用户口径(必须严格遵循): 我上德国站, 就只看在德国有效的商标; 上英国站就只看英国的。
+ * 别的国家有商标 ≠ 我不能上这个站。所以:
+ *   1) 先用保护范围(protection)把命中切成「在本市场有效」和「只在别的市场有效」两堆
+ *   2) 风险等级只由「在本市场有效」那堆决定
+ *   3) 「只在别的市场有效」那堆只作参考展示, 一句话带过, 不参与打分
+ *
+ * 商标与外观仍然分开算(文字命中对商标是强证据, 对外观只是线索)。
+ * @param {Array} hits 归一化后的命中条目(带 kind / office / protection)
+ * @param {Object} opt { term, nice:[], locarno:[], market }
  */
 function assess(hits, opt = {}) {
   const term = tight(opt.term);
@@ -560,6 +683,19 @@ function assess(hits, opt = {}) {
   const wantLoc = (opt.locarno || []).map(String);
   const hasNiceFilter = wantNice.size > 0;
   const hasLocFilter = wantLoc.length > 0;
+  const market = opt.market || null;
+  const req = market && Array.isArray(market.requires) && market.requires.length ? new Set(market.requires) : null;
+  const mktName = market ? market.name : '全部市场';
+
+  /** 这条记录在目标市场有没有效力 */
+  const inMarket = (h) => {
+    if (!req) return true;                                  // 没指定站点 → 退回全球口径
+    const p = Array.isArray(h.protection) ? h.protection : [];
+    if (p.length) return p.some((x) => req.has(x));         // 有保护范围 → 精确判断
+    return req.has(h.office);                               // 没有保护范围 → 用局别兜底
+  };
+  const scoped = hits.filter(inMarket);
+  const others = hits.filter((h) => !inMarket(h));
 
   const isExact = (h) => { const t = tight(h.title); return !!t && (t === term || t.replace(/^(the|a|an)/, '') === term); };
   const isNear = (h) => {
@@ -592,8 +728,9 @@ function assess(hits, opt = {}) {
     return { list, alive, pending, dead, exact: list.filter(isExact), exactAlive: alive.filter(isExact), nearAlive: alive.filter(isNear), strong };
   };
 
-  const tm = seg(hits.filter((h) => h.kind !== 'design'));
-  const dz = seg(hits.filter((h) => h.kind === 'design'));
+  /* ★ 风险只按「在目标市场有效」的记录算, 别国的命中走 others, 不参与打分 */
+  const tm = seg(scoped.filter((h) => h.kind !== 'design'));
+  const dz = seg(scoped.filter((h) => h.kind === 'design'));
 
   /* ---------------- 商标风险 ---------------- */
   const tmReasons = [];
@@ -605,10 +742,10 @@ function assess(hits, opt = {}) {
 
     if (exactAliveInClass.length) {
       tmLevel = 'high'; tmScore = 98;
-      tmReasons.push(`❌ 找到 ${exactAliveInClass.length} 件【有效】注册商标，名称完全相同，且就在你指定的类目内 —— 直接使用会侵权。`);
+      tmReasons.push(`❌ 找到 ${exactAliveInClass.length} 件【有效】注册商标，名称完全相同，且就在你指定的类目内 —— 在${mktName}直接使用会侵权。`);
     } else if (exactAliveUnknown.length) {
       tmLevel = 'high'; tmScore = hasNiceFilter ? 82 : 90;
-      tmReasons.push(`❌ 找到 ${exactAliveUnknown.length} 件【有效】注册商标，名称完全相同${hasNiceFilter ? '（未标类目，无法确认是否同类别）' : '（未限定类目）'} —— 存在直接侵权风险。`);
+      tmReasons.push(`❌ 找到 ${exactAliveUnknown.length} 件【有效】注册商标，名称完全相同${hasNiceFilter ? '（未标类目，无法确认是否同类别）' : '（未限定类目）'} —— 在${mktName}存在直接侵权风险。`);
     } else if (exactAliveOut.length) {
       tmLevel = 'medium'; tmScore = 55;
       tmReasons.push(`⚠️ 找到 ${exactAliveOut.length} 件【有效】同名注册商标，但类目不同 —— 跨类目仍可能构成混淆，需谨慎。`);
@@ -634,8 +771,13 @@ function assess(hits, opt = {}) {
       && LEVEL_RANK[tmLevel] <= LEVEL_RANK.low) {
       tmReasons.push(`ℹ️ 同名商标 ${tm.exact.length} 件均已失效 —— 一般可用，确认无续展/复活即可。`);
     }
-    if (!tm.list.length) tmReasons.push('✅ 商标库未查到相关记录。');
-    else if (LEVEL_RANK[tmLevel] <= LEVEL_RANK.none) tmReasons.push(`ℹ️ 命中 ${tm.list.length} 条，但都跟你的名称没实质关系。`);
+    if (!tm.list.length) {
+      tmReasons.push(market
+        ? `✅ 在${mktName}没有任何相关商标记录。`
+        : '✅ 商标库未查到相关记录。');
+    } else if (LEVEL_RANK[tmLevel] <= LEVEL_RANK.none) {
+      tmReasons.push(`ℹ️ 在${mktName}命中 ${tm.list.length} 条，但都跟你的名称没实质关系。`);
+    }
   }
 
   /* ---------------- 外观风险 ---------------- */
@@ -643,7 +785,9 @@ function assess(hits, opt = {}) {
   let dzLevel = 'unknown', dzScore = 0;
   if (!dz.list.length) {
     dzLevel = 'none';
-    dzReasons.push('未查到相关外观设计记录（或该数据源未启用）。');
+    dzReasons.push(market
+      ? `未在${mktName}查到相关外观设计记录（或该数据源对这个站不适用）。`
+      : '未查到相关外观设计记录（或该数据源未启用）。');
   } else {
     const exactAlive = dz.exactAlive.filter((h) => inClass(h) !== false);
     const nearAlive = dz.nearAlive.filter((h) => inClass(h) !== false);
@@ -665,19 +809,33 @@ function assess(hits, opt = {}) {
   const level = worse(tmLevel, dzLevel);
   const score = Math.max(tmScore, dzScore);
   const reasons = [...tmReasons, ...dzReasons];
+
+  /* ★ 「别的市场有商标」只作参考 —— 明确告诉用户这不影响他上这个站 */
+  if (others.length) {
+    const byOffice = {};
+    others.forEach((h) => { const k = h.officeName || h.office || '?'; byOffice[k] = (byOffice[k] || 0) + 1; });
+    const detail = Object.keys(byOffice).sort((a, b) => byOffice[b] - byOffice[a])
+      .slice(0, 8).map((k) => k + ' ' + byOffice[k]).join(' / ');
+    const othersAlive = others.filter((h) => h.statusGroup === 'alive').length;
+    reasons.push(`ℹ️ 另有 ${others.length} 条记录只在你没选的其它市场有效（有效 ${othersAlive} 条）: ${detail} —— 不影响你上${mktName}，已折叠。`);
+  }
+
   if (LEVEL_RANK[level] <= LEVEL_RANK.low) {
     reasons.push('⚠️ 官方库只能查"文字"。图形商标(Logo/图案)需要图形近似检索，不在本结果覆盖范围内。');
   }
 
-  const aliveAll = hits.filter((h) => h.statusGroup === 'alive').length;
-  const pendingAll = hits.filter((h) => h.statusGroup === 'pending').length;
-  const deadAll = hits.filter((h) => h.statusGroup === 'dead').length;
+  const aliveAll = scoped.filter((h) => h.statusGroup === 'alive').length;
+  const pendingAll = scoped.filter((h) => h.statusGroup === 'pending').length;
+  const deadAll = scoped.filter((h) => h.statusGroup === 'dead').length;
 
   return {
-    level, score, advice: ADVICE[level], reasons,
+    level, score,
+    advice: (ADVICE_MARKET[level] || ADVICE_MARKET.unknown)(mktName),
+    reasons,
+    market: market ? { sites: market.sites, name: market.name, requires: market.requires, offices: market.offices, label: market.label } : null,
     trademark: { level: tmLevel, score: tmScore, total: tm.list.length, alive: tm.alive.length, pending: tm.pending.length, dead: tm.dead.length, exactAlive: tm.exactAlive.length },
     design: { level: dzLevel, score: dzScore, total: dz.list.length, alive: dz.alive.length, pending: dz.pending.length, dead: dz.dead.length, exactAlive: dz.exactAlive.length },
-    counts: { total: hits.length, alive: aliveAll, pending: pendingAll, dead: deadAll },
+    counts: { total: hits.length, scoped: scoped.length, otherMarkets: others.length, alive: aliveAll, pending: pendingAll, dead: deadAll },
     exact: {
       alive: tm.exactAlive.length,
       aliveAnyClass: tm.exactAlive.length,
@@ -690,33 +848,62 @@ function assess(hits, opt = {}) {
 
 /* ============================ 统一检索入口 ============================ */
 
+/** 数据源 → 它属于哪个区域局。目标站点的管辖局列表里没有这个局, 就跳过, 省一次无用请求。
+ * ★ 注意用 market.offices 判断而不是 market.requires:
+ *     amazon.de 的 offices = [DE, EM, WO] → 含 EM → 欧盟局要查(欧盟商标覆盖德国) ✓
+ *     amazon.co.uk 的 offices = [GB, WO]   → 不含 EM → 欧盟局跳过(脱欧后与英国无关) ✓
+ */
+const SOURCE_REGIONS = {
+  tmview: null,            // null = 全球聚合, 永远要查
+  uspto: 'US',
+  'euipo-tm': 'EM',
+  'euipo-rcd': 'EM',
+};
+
 /**
  * @param {string} term 关键词 / 品牌名
- * @param {Object} opt  { sources:[], offices:[], nice:[], locarno:[], limit, aliveOnly, registeredOnly }
+ * @param {Object} opt  { sites:[], sources:[], nice:[], locarno:[], limit, aliveOnly, registeredOnly }
+ *   sites 例: ['amazon.de'] / ['amazon.de','amazon.co.uk'] —— 决定"只看哪些地区有效的商标"
  */
 async function search(term, opt = {}) {
   const q = String(term || '').trim();
   const t0 = nowMs();
   if (!q) return { ok: false, error: '关键词不能为空', term: q };
 
-  const srcIds = (Array.isArray(opt.sources) && opt.sources.length ? opt.sources : DEFAULT_SOURCES)
+  const market = marketFromSites(opt.sites);
+  const wantOffices = market ? market.offices
+    : (Array.isArray(opt.offices) && opt.offices.length ? opt.offices : []);
+
+  let srcIds = (Array.isArray(opt.sources) && opt.sources.length ? opt.sources : DEFAULT_SOURCES)
     .map(String).filter((s) => PROVIDERS[s]);
   if (!srcIds.length) return { ok: false, error: '没有可用的数据源', term: q };
 
+  // ★ 按目标市场裁剪数据源: 上英国站就别去问欧盟局(脱欧后无关), 上德国站就别去问美国局
+  const skipped = [];
+  if (market) {
+    srcIds = srcIds.filter((id) => {
+      const need = SOURCE_REGIONS[id];
+      if (!need) return true;
+      const hit = market.offices.indexOf(need) >= 0;
+      if (!hit) skipped.push({ source: id, sourceName: PROVIDERS[id].name, reason: `与${market.name}无关，已跳过` });
+      return hit;
+    });
+  }
+
   const limit = Math.max(1, Math.min(100, Number(opt.limit) || 30));
-  const settled = await Promise.all(srcIds.map(async (id) => {
+  const settled = srcIds.length ? await Promise.all(srcIds.map(async (id) => {
     const P = PROVIDERS[id];
     if (!P.ready || !P.run) return { id, ok: false, error: '该数据源需要浏览器自动化，暂未接入', items: [], total: 0 };
     try {
       const r = await P.run(q, {
-        offices: opt.offices, nice: opt.nice, locarno: opt.locarno, limit,
+        offices: wantOffices, nice: opt.nice, locarno: opt.locarno, limit,
         aliveOnly: opt.aliveOnly !== false, registeredOnly: !!opt.registeredOnly,
       });
       return { id, ok: true, ...r };
     } catch (e) {
       return { id, ok: false, error: (e && e.message) || String(e), items: [], total: 0, sourceName: P.name };
     }
-  }));
+  })) : [];
 
   const results = settled.map((s) => ({
     source: s.id, sourceName: s.sourceName || PROVIDERS[s.id].name,
@@ -731,24 +918,34 @@ async function search(term, opt = {}) {
     const k = tight(it.title) + '|' + it.office + '|' + (it.id || '');
     if (seen.has(k)) return; seen.add(k); all.push(it);
   }));
-  // 有效在前，再按时间新→旧
+
+  // ★ 排序: 先在目标市场有效的 → 再有效 → 再新→旧
+  const inMarketFn = (h) => {
+    if (!market) return true;
+    const p = Array.isArray(h.protection) ? h.protection : [];
+    if (p.length) return p.some((x) => market.requires.indexOf(x) >= 0);
+    return market.requires.indexOf(h.office) >= 0;
+  };
   const ORDER = { alive: 0, pending: 1, unknown: 2, dead: 3 };
-  all.sort((a, b) => (ORDER[a.statusGroup] ?? 9) - (ORDER[b.statusGroup] ?? 9)
+  all.forEach((h) => { h.inMarket = inMarketFn(h); });
+  all.sort((a, b) => (a.inMarket === b.inMarket ? 0 : (a.inMarket ? -1 : 1))
+    || (ORDER[a.statusGroup] ?? 9) - (ORDER[b.statusGroup] ?? 9)
     || String(b.filed || '').localeCompare(String(a.filed || '')));
 
-  const risk = assess(all, { term: q, nice: opt.nice, locarno: opt.locarno });
+  const risk = assess(all, { term: q, nice: opt.nice, locarno: opt.locarno, market });
 
   return {
     ok: true, term: q, tookMs: nowMs() - t0,
+    market: market ? { sites: market.sites, name: market.name, label: market.label, requires: market.requires, offices: market.offices } : null,
     sources: results.map((r) => ({ source: r.source, sourceName: r.sourceName, ok: r.ok, error: r.error, total: r.total, cached: r.cached, returned: r.items.length })),
+    skipped,
     risk,
     counts: {
-      byOffice: all.reduce((m, h) => { m[h.office || '?'] = (m[h.office || '?'] || 0) + 1; return m; }, {}),
+      byOffice: all.filter((h) => h.inMarket).reduce((m, h) => { m[h.office || '?'] = (m[h.office || '?'] || 0) + 1; return m; }, {}),
       bySource: results.reduce((m, r) => { m[r.source] = r.ok ? r.items.length : -1; return m; }, {}),
     },
     total: all.length,
-    items: all.slice(0, Math.max(limit, 50)),
-    providerList: providerList(),
+    items: all.slice(0, Math.max(limit * 2, 60)),
   };
 }
 
@@ -775,8 +972,8 @@ function brandVerdict(risk) {
 }
 
 module.exports = {
-  search, assess, brandVerdict, providerList,
-  PROVIDERS, DEFAULT_SOURCES, OFFICES, officeName,
+  search, assess, brandVerdict, providerList, siteList, marketFromSites,
+  PROVIDERS, DEFAULT_SOURCES, OFFICES, officeName, AMAZON_SITES, EU_MEMBERS,
   cacheStats, cacheClear, normTerm, tight,
   parseNiceList, tmStatusGroup, designStatusGroup,
   _searchTmview: searchTmview, _searchUspto: searchUspto,
@@ -787,16 +984,22 @@ module.exports = {
 if (require.main === module) {
   (async () => {
     const term = process.argv[2] || 'air fryer';
-    const sources = (process.argv[3] || 'tmview,uspto,euipo-tm,euipo-rcd').split(',');
-    console.log('查: ' + term + '  数据源: ' + sources.join(','));
-    const r = await search(term, { sources, limit: 5, nice: process.argv[4] });
-    console.log('\n耗时 ' + r.tookMs + 'ms  命中 ' + r.total);
+    const sites = (process.argv[3] || 'amazon.de').split(',');
+    const sources = (process.argv[4] || 'tmview,uspto,euipo-tm,euipo-rcd').split(',');
+    const nice = process.argv[5];
+    const mkt = marketFromSites(sites);
+    console.log('查: ' + term);
+    console.log('目标站点: ' + (mkt ? mkt.flag + ' ' + mkt.label : '(未指定 → 全球口径)'));
+    console.log('数据源: ' + sources.join(','));
+    const r = await search(term, { sites, sources, limit: 5, nice });
+    console.log('\n耗时 ' + r.tookMs + 'ms  总计命中 ' + r.total + ' / 本市场相关 ' + r.risk.counts.scoped + ' / 别国 ' + r.risk.counts.otherMarkets);
     console.log('数据源: ' + r.sources.map((s) => `${s.sourceName}=${s.ok ? s.returned + '/' + s.total : '✗' + s.error}`).join('  '));
+    if (r.skipped.length) console.log('已跳过: ' + r.skipped.map((s) => s.sourceName + '(' + s.reason + ')').join(' '));
     console.log('风险: ' + r.risk.level + ' (' + r.risk.score + ') ' + r.risk.advice);
-    console.log('  商标: ' + r.risk.trademark.level + ' (有效' + r.risk.trademark.alive + '/同名有效' + r.risk.trademark.exactAlive + ')');
-    console.log('  外观: ' + r.risk.design.level + ' (有效' + r.risk.design.alive + ')');
+    console.log('  商标: ' + r.risk.trademark.level + ' (本市场有效 ' + r.risk.trademark.alive + ' / 同名有效 ' + r.risk.trademark.exactAlive + ')');
+    console.log('  外观: ' + r.risk.design.level + ' (本市场有效 ' + r.risk.design.alive + ')');
     r.risk.reasons.forEach((x) => console.log('   · ' + x));
-    console.log('\n前几条:');
-    r.items.slice(0, 8).forEach((it) => console.log(`  [${it.kind}/${it.statusGroup}] ${it.officeName} "${it.title}" | ${it.status} | 尼斯${JSON.stringify(it.nice)} | ${it.owner}`.slice(0, 175)));
+    console.log('\n前几条(带 ★ 的表示在本市场有效):');
+    r.items.slice(0, 10).forEach((it) => console.log(`  ${it.inMarket ? '★' : ' '}[${it.kind}/${it.statusGroup}] ${it.officeName} "${it.title}" | ${it.status} | 尼斯${JSON.stringify(it.nice)} | ${(it.owner || '').slice(0, 30)}`.slice(0, 175)));
   })().catch((e) => { console.error('失败: ' + e.stack); process.exit(1); });
 }
