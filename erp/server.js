@@ -2800,7 +2800,11 @@ async function cdpEnrichOne(send, host, it, filter) {
       if (d.regionText) {
         it.amazonSell = !!d.amazonSell;
         if (d.fulfill) it.fulfill = d.fulfill;                 // 未读到配送证据 → 保持 null (未知, 不猜 FBM)
-        it.sellerRegion = d.regionText.slice(0, 200);
+        // ★ 2026-09-30 修复: 这里原来写 it.sellerRegion = d.regionText.slice(0,200)。
+        //   regionText 是「BuyBox 主报价区已渲染」的**诊断信号串**(= 主信息/配送/表格/BuyBox 四段页面文本拼接,
+        //   见本文件 out.regionText 的构造), 不是产地 —— 存进去的是 "£331.20… In stock Quantity: 1 2 3…" 这种整段页面文本。
+        //   且全项目【没有任何地方读 sellerRegion】(只写/只合并/只透传), 属于污染数据的死字段 → 停止写入。
+        //   将来若真要产地, 应从卖家简介页/卖家名反查, 不要拿诊断串充数。
       }
       if (d.mainSeller) it.mainSeller = d.mainSeller;
       if (siteSymbolOk(d.curSymbol, it.site || host)) it.priceSymbol = d.curSymbol;
@@ -4004,7 +4008,7 @@ async function cdpReadDetail(send, host, it) {
     if (d.regionText) {
       it.amazonSell = !!d.amazonSell;
       it.fulfill = d.fulfill || null;          // 未读到配送证据 → null (未知, 绝不猜成 FBM)
-      it.sellerRegion = d.regionText.slice(0, 200);
+      // sellerRegion 已停写: 这里原来写 d.regionText(诊断串, 非产地) —— 见本文件 2800 行处的完整说明
     }
     if (d.mainSeller) it.mainSeller = d.mainSeller;
     if (siteSymbolOk(d.curSymbol, it.site || host)) it.priceSymbol = d.curSymbol;
@@ -4083,6 +4087,31 @@ function isBrandLike(b) {
 //   现改为【面板读到就覆盖】—— 这些字段面板是唯一权威来源, 不覆盖就等于永远采不到新数据。
 //   但"这次没读到"绝不清空旧值(避免临时读不到把好数据洗掉)。
 //   同时落盘 panelOk/panelFields/panelAt/fulfillSrc, 让"到底采到没有、依据是什么"可验证。
+/**
+ * 商标数 + 状态串 → 品牌备案状态 (brandStatus)
+ *
+ * 语义 (与筛选面板「品牌状态」一一对应):
+ *   registered = 已备案/已注册   → 筛选里「排除已备案」用它
+ *   notfound   = 查过了确实没有   → 筛选里「仅未查到」用它
+ *   unchecked  = 有商标记录但未达备案门槛 (或还没核实)
+ *   null       = 面板没给商标信息 → 【不覆盖】原值, 别拿"未知"冒充"已核查"
+ *
+ * ★ 2026-09-30 修复: 以前各入库路径一律写死 'unchecked', 导致「排除已备案 / 仅未查到 / 排除TM」
+ *   三个筛选形同虚设 (实测全库 3160 条 unchecked / 2 notfound / 1 registered)。
+ *   另外旧的 count>60 阈值不可达 (实测库内最大 29) → 改以【状态串】为准, 数值仅兜底。
+ */
+function brandStatusFromTm(count, statusStr) {
+  const st = String(statusStr || '');
+  // ★ 面板 only 给得到商标信息 (形如「28个注册商标」/「28个已申请」), 拿不到亚马逊 Brand Registry 的备案状态。
+  //   对筛选用途而言两者等价 —— 「排除已备案」就是要避开"已被保护、抢不动"的品牌, 所以把
+  //   「注册商标」也归入 registered。(原始串仍完整保留在 tmText 里, 要看原文随时能看)
+  if (/已注册|已备案|已登记|注册商标/.test(st)) return 'registered';
+  if (/未查到|查无|无记录|不存在/.test(st)) return 'notfound';
+  const c = (count != null && count !== '' && !isNaN(Number(count))) ? Number(count) : null;
+  if (c != null && c > 0) return 'unchecked';     // 有商标记录但没说"已注册/已备案" → 保守判未核查
+  return null;                                     // 面板没给 → 不覆盖
+}
+
 function mergePanelInto(it, pd) {
   if (!pd || typeof pd !== 'object') return it;
   let n = 0;
@@ -4095,6 +4124,25 @@ function mergePanelInto(it, pd) {
   };
   if (pd.brand && !it.brand) { it.brand = pd.brand; n++; }   // 品牌仍只补空: 卡片/面包屑品牌比面板干净(面板会带"未查到")
   if (pd.fulfill) { if (it.fulfill !== pd.fulfill) n++; it.fulfill = pd.fulfill; it.fulfillSrc = 'panel'; }
+  // ★★ 2026-09-30 关键修复: 面板解析(links-collector.parsePanelText)产出的是
+  //    tmStatus = { count, status }  ← 例如 { count:28, status:'已申请' }
+  //    而下面几行原来只读 tmText / trademarkCount / tmCountries —— 字段名对不上,
+  //    pd.tmStatus 【没有任何一行代码读它】→ 商标信息整段丢弃。
+  //    实测代价: 全库 3163 条 tmText 全空、tmMark 恒 false、brandStatus 3160 条 unchecked。
+  //    这里先把 tmStatus 正规化, 并顺手推导 brandStatus / tmMark。
+  const _tms = (pd.tmStatus && typeof pd.tmStatus === 'object') ? pd.tmStatus
+    : ((pd.trademark && typeof pd.trademark === 'object') ? pd.trademark : null);
+  if (_tms && (_tms.count != null || _tms.status)) {
+    const _cnt = (_tms.count != null && !isNaN(Number(_tms.count))) ? Number(_tms.count) : null;
+    const _st = String(_tms.status || '').trim();
+    const _txt = ((_cnt != null ? _cnt + '个' : '') + _st).trim();
+    if (_txt && it.tmText !== _txt) { it.tmText = _txt; n++; }
+    if (_cnt != null && it.trademarkCount !== _cnt) { it.trademarkCount = _cnt; n++; }
+    const _bs = brandStatusFromTm(_cnt, _st);
+    if (_bs && it.brandStatus !== _bs) { it.brandStatus = _bs; n++; }
+    const _isTm = /注册商标|TM|已申请/.test(_st);
+    if (_isTm !== !!it.tmMark) { it.tmMark = _isTm; n++; }
+  }
   if (pd.tmText) { it.tmText = pd.tmText; n++; }
   if (pd.trademarkCount != null) { it.trademarkCount = pd.trademarkCount; n++; }
   if (pd.tmCountries && pd.tmCountries.length) { it.tmCountries = pd.tmCountries; n++; }
@@ -5273,7 +5321,7 @@ async function cdpFollowShopChain(url, opts = {}) {
           if (d.regionText) {
             it.amazonSell = !!d.amazonSell;
             if (d.fulfill) it.fulfill = d.fulfill;
-            it.sellerRegion = d.regionText.slice(0, 200);
+            // sellerRegion 已停写: 这里原来写 d.regionText(诊断串, 非产地) —— 见本文件 2800 行处的完整说明
           }
           if (d.mainSeller) it.mainSeller = d.mainSeller;
           if (siteSymbolOk(d.curSymbol, it.site || host)) it.priceSymbol = d.curSymbol;
@@ -6350,7 +6398,7 @@ async function cdpBackfillMainImage(opts = {}) {
           it.amazonSell = !!d.amazonSell;
           if (d.fulfill) it.fulfill = d.fulfill;
           else if (!wasVerified) it.fulfill = null;       // 旧值是默认猜的 → 清成"未知", 不留假数据
-          it.sellerRegion = d.regionText.slice(0, 200);
+          // sellerRegion 已停写: 这里原来写 d.regionText(诊断串, 非产地) —— 见本文件 2800 行处的完整说明
         }
         if (d.mainSeller) it.mainSeller = d.mainSeller;
         if (siteSymbolOk(d.curSymbol, it.site || host)) it.priceSymbol = d.curSymbol;
@@ -7230,17 +7278,26 @@ function ingestLinksProducts(items, site, source) {
       seller: p.seller || null,
       sellerLink: p.sellerLink || null,
       sellerCount,
-      // ★ 路线 B: 有商标状态就据实判定 (与 cdp-brand 同一口径); 没有则保持未知
+      // ★ 2026-09-30 修复: 原来这里【完全不写 tmText】, 且「注册商标」被判成 unchecked。
+      //   实测后果: 全库 3163 条 tmText 全空 → tmMark 恒 false →「排除 TM」筛选失效;
+      //             brandStatus 几乎全 unchecked →「排除已备案/仅未查到」也失效。
+      //   现改用共享的 brandStatusFromTm (与 mergePanelInto 同一口径), 并补上 tmText 原文。
       brandStatus: (function () {
         const st = p.tmStatus && p.tmStatus.status ? String(p.tmStatus.status) : '';
-        if (/已注册|已备案/.test(st)) return 'registered';
-        if (/未查到/.test(st)) return 'notfound';
-        if (/注册商标/.test(st)) return 'unchecked';
-        return 'unchecked';
+        const c = (typeof p.tmStatus === 'number') ? p.tmStatus : (p.tmStatus ? digits(p.tmStatus.count) : null);
+        return brandStatusFromTm(c, st) || 'unchecked';
       })(),
       bgMark: false,
-      tmMark: /TM|注册商标/.test(String((p.tmStatus && p.tmStatus.status) || '')),
+      tmMark: /TM|注册商标|已申请/.test(String((p.tmStatus && p.tmStatus.status) || '')),
       patentRisk: false,
+      // 商标原文: "28个注册商标" / "28个已申请" —— 保留原文, 便于人工核对与以后重新判定
+      tmText: (function () {
+        if (!p.tmStatus) return null;
+        if (typeof p.tmStatus === 'number') return p.tmStatus + '个';
+        const c = digits(p.tmStatus.count);
+        const st = String(p.tmStatus.status || '').trim();
+        return (((c != null ? c + '个' : '') + st).trim()) || null;
+      })(),
       trademarkCount: (typeof p.tmStatus === 'number') ? p.tmStatus : (p.tmStatus ? (digits(p.tmStatus.count) || 0) : 0),
       followCount: sellerCount || 0,
       chinaSeller: false,
